@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- DONKEYBOTI URDF — AMR configuration
+     Sensors: Pacecat LDS-M300-E LiDAR + MRDVS S10 Ultra Camera
+     Original 2D LiDAR (base_scan) replaced with M300 3D LiDAR
+-->
+<robot name="DONKEYBOTI" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+    <material name="black"><color rgba="0.0 0.0 0.0 1.0"/></material>
+    <material name="blue"><color rgba="0.0 0.0 0.8 1.0"/></material>
+    <material name="green"><color rgba="0.0 0.8 0.0 1.0"/></material>
+    <material name="yellow"><color rgba="1.0 1.0 0.0 1.0"/></material>
+
+    <!-- ============ Base ============ -->
+    <link name="base_footprint"/>
+
+    <joint name="base_joint" type="fixed">
+        <origin xyz="0.0 0.0 0.1005" rpy="0.0 0.0 0.0"/>
+        <parent link="base_footprint"/>
+        <child link="base_link"/>
+    </joint>
+
+    <link name="base_link">
+        <visual>
+            <origin xyz="0.942 0.326 -0.1005" rpy="1.57 0.0 -1.57"/>
+            <geometry>
+                <mesh filename="package://omorobot_description/meshes/bases/DONKEYBOTI_BODY.stl" scale="0.001 0.001 0.001"/>
+            </geometry>
+            <material name="yellow"/>
+        </visual>
+    </link>
+
+    <!-- ============ Wheels ============ -->
+    <joint name="wheel_left_joint" type="continuous">
+        <origin xyz="0.0 0.283 0.0" rpy="-1.57 0.0 0.0"/>
+        <parent link="base_link"/>
+        <child link="wheel_left_link"/>
+        <axis xyz="0.0 0.0 1.0"/>
+    </joint>
+
+    <link name="wheel_left_link">
+        <visual>
+            <origin xyz="-0.1005 -0.1005 0.0275" rpy="0.0 1.57 0.0"/>
+            <geometry>
+                <mesh filename="package://omorobot_description/meshes/wheels/DONKEYBOTI_WHEEL.stl" scale="0.001 0.001 0.001"/>
+            </geometry>
+            <material name="blue"/>
+        </visual>
+    </link>
+
+    <joint name="wheel_right_joint" type="continuous">
+        <origin xyz="0.0 -0.283 0.0" rpy="-1.57 0.0 0.0"/>
+        <parent link="base_link"/>
+        <child link="wheel_right_link"/>
+        <axis xyz="0.0 0.0 1.0"/>
+    </joint>
+
+    <link name="wheel_right_link">
+        <visual>
+            <origin xyz="-0.1005 -0.1005 0.0275" rpy="0.0 1.57 0.0"/>
+            <geometry>
+                <mesh filename="package://omorobot_description/meshes/wheels/DONKEYBOTI_WHEEL.stl" scale="0.001 0.001 0.001"/>
+            </geometry>
+            <material name="blue"/>
+        </visual>
+    </link>
+
+    <!-- ============ IMU (on-board) ============ -->
+    <joint name="imu_joint" type="fixed">
+        <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 1.57"/>
+        <parent link="base_link"/>
+        <child link="imu_link"/>
+    </joint>
+    <link name="imu_link"/>
+
+    <!-- ============ Pacecat LDS-M300-E 3D LiDAR ============ -->
+    <!-- Front-top of robot. This is the LiDAR optical center.
+         base_footprint → base_link(+0.1005) → m300_link(+0.335, 0, +0.5295)
+         So m300_link is at (0.335, 0, 0.63) from base_footprint -->
+    <joint name="m300_joint" type="fixed">
+        <origin xyz="0.335 0.0 0.5295" rpy="0.0 0.0 0.0"/>
+        <parent link="base_link"/>
+        <child link="m300_link"/>
+    </joint>
+
+    <link name="m300_link">
+        <visual>
+            <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+            <geometry><cylinder radius="0.05" length="0.07"/></geometry>
+            <material name="black"/>
+        </visual>
+    </link>
+
+    <!-- M300 internal IMU (IIM-42652)
+         Offset from LiDAR optical center per manual §5.5:
+         x=+19.4mm, y=-28.7mm, z=-45.2mm
+         FAST-LIO2 'body' frame = this frame -->
+    <joint name="m300_imu_joint" type="fixed">
+        <origin xyz="0.0194 -0.0287 -0.0452" rpy="0.0 0.0 0.0"/>
+        <parent link="m300_link"/>
+        <child link="m300_imu_link"/>
+    </joint>
+    <link name="m300_imu_link"/>
+
+    <!-- ============ MRDVS S10 Ultra Stereo Camera ============ -->
+    <!-- Front, below LiDAR. Adjust xyz to actual mount. -->
+    <joint name="s10_ultra_joint" type="fixed">
+        <origin xyz="0.35 0.0 0.35" rpy="0.0 0.0 0.0"/>
+        <parent link="base_link"/>
+        <child link="s10_ultra_link"/>
+    </joint>
+
+    <link name="s10_ultra_link">
+        <visual>
+            <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+            <geometry><box size="0.03 0.18 0.03"/></geometry>
+            <material name="black"/>
+        </visual>
+    </link>
+
+    <!-- Camera optical frames (ROS convention: z-forward, x-right, y-down) -->
+    <joint name="s10_ultra_left_optical_joint" type="fixed">
+        <origin xyz="0.0 0.06 0.0" rpy="-1.5708 0.0 -1.5708"/>
+        <parent link="s10_ultra_link"/>
+        <child link="s10_ultra_left_optical"/>
+    </joint>
+    <link name="s10_ultra_left_optical"/>
+
+    <joint name="s10_ultra_right_optical_joint" type="fixed">
+        <origin xyz="0.0 -0.06 0.0" rpy="-1.5708 0.0 -1.5708"/>
+        <parent link="s10_ultra_link"/>
+        <child link="s10_ultra_right_optical"/>
+    </joint>
+    <link name="s10_ultra_right_optical"/>
+
+</robot>

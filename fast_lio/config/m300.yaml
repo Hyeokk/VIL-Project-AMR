@@ -1,37 +1,36 @@
 /**:
     ros__parameters:
-        feature_extract_enable: false
+        # FAST-LIO2 config for Pacecat LDS-M300-E on DONKEYBOTI
+        # Reference: donkibot_autonomous/src/fast_lio/config/m300_donki.yaml
         point_filter_num: 3
         max_iteration: 3
         filter_size_surf: 0.5
         filter_size_map: 0.5
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
-        map_file_path: "./test.pcd"
 
         common:
-            lid_topic:  "/m300/pointcloud"
-            imu_topic:  "/m300/imu"
+            lid_topic: "/pointcloud"
+            imu_topic: "/imu"
             time_sync_en: false
             time_offset_lidar_to_imu: 0.0
 
         preprocess:
-            lidar_type: 5                # 5 = PACECAT M300
-            scan_line:  1                # non-repetitive (no fixed scan lines)
-            blind: 0.5                   # min range (m)
-            timestamp_unit: 3            # 3 = NS (nanoseconds)
-            scan_rate: 10                # 10 Hz scan frequency
+            lidar_type: 5                # PACECAT (m300_handler)
+            scan_line: 6
+            scan_rate: 10
+            timestamp_unit: 3            # NS (nanoseconds) - M300 driver timestamp
+            blind: 0.5
 
         mapping:
             acc_cov: 0.1
             gyr_cov: 0.1
             b_acc_cov: 0.0001
             b_gyr_cov: 0.0001
-            fov_degree:    360.0
-            det_range:     50.0
-            extrinsic_est_en:  true      # online estimation of IMU-LiDAR extrinsic
-            # IMU position relative to LiDAR optical center (from M300 manual)
-            # Units: meters (19.4mm, -28.7mm, -45.2mm)
+            fov_degree: 360.0
+            det_range: 50.0
+            extrinsic_est_en: false
+            # LiDAR→IMU extrinsic (M300 manual §5.5: 19.4, -28.7, -45.2 mm)
             extrinsic_T: [ 0.0194, -0.0287, -0.0452 ]
             extrinsic_R: [ 1., 0., 0.,
                            0., 1., 0.,
@@ -39,10 +38,8 @@
 
         publish:
             path_en: true
-            effect_map_en: false
-            map_en: true
-            scan_publish_en:  true
-            dense_publish_en: false
+            scan_publish_en: true
+            dense_publish_en: true
             scan_bodyframe_pub_en: true
 
         pcd_save:
