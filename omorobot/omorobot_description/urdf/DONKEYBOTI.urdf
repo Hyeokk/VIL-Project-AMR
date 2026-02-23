@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- DONKEYBOTI URDF — AMR configuration
-     Sensors: Pacecat LDS-M300-E LiDAR + MRDVS S10 Ultra Camera
-     Original 2D LiDAR (base_scan) replaced with M300 3D LiDAR
+     Sensors:
+       - Pacecat LDS-M300-E LiDAR (TF from URDF: base_link -> m300_link)
+       - MRDVS S10 Ultra Camera (TF from driver: base_link -> mrdvs_tof)
 -->
 <robot name="DONKEYBOTI" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
     <material name="black"><color rgba="0.0 0.0 0.0 1.0"/></material>
     <material name="blue"><color rgba="0.0 0.0 0.8 1.0"/></material>
-    <material name="green"><color rgba="0.0 0.8 0.0 1.0"/></material>
     <material name="yellow"><color rgba="1.0 1.0 0.0 1.0"/></material>
 
     <!-- ============ Base ============ -->
@@ -73,9 +73,8 @@
     <link name="imu_link"/>
 
     <!-- ============ Pacecat LDS-M300-E 3D LiDAR ============ -->
-    <!-- Front-top of robot. This is the LiDAR optical center.
-         base_footprint → base_link(+0.1005) → m300_link(+0.335, 0, +0.5295)
-         So m300_link is at (0.335, 0, 0.63) from base_footprint -->
+    <!-- Front-top of robot (LiDAR optical center)
+         Height from base_footprint: 0.1005 + 0.5295 = 0.63m -->
     <joint name="m300_joint" type="fixed">
         <origin xyz="0.335 0.0 0.5295" rpy="0.0 0.0 0.0"/>
         <parent link="base_link"/>
@@ -91,7 +90,7 @@
     </link>
 
     <!-- M300 internal IMU (IIM-42652)
-         Offset from LiDAR optical center per manual §5.5:
+         Offset from LiDAR optical center per manual 5.5:
          x=+19.4mm, y=-28.7mm, z=-45.2mm
          FAST-LIO2 'body' frame = this frame -->
     <joint name="m300_imu_joint" type="fixed">
@@ -101,35 +100,8 @@
     </joint>
     <link name="m300_imu_link"/>
 
-    <!-- ============ MRDVS S10 Ultra Stereo Camera ============ -->
-    <!-- Front, below LiDAR. Adjust xyz to actual mount. -->
-    <joint name="s10_ultra_joint" type="fixed">
-        <origin xyz="0.35 0.0 0.35" rpy="0.0 0.0 0.0"/>
-        <parent link="base_link"/>
-        <child link="s10_ultra_link"/>
-    </joint>
-
-    <link name="s10_ultra_link">
-        <visual>
-            <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
-            <geometry><box size="0.03 0.18 0.03"/></geometry>
-            <material name="black"/>
-        </visual>
-    </link>
-
-    <!-- Camera optical frames (ROS convention: z-forward, x-right, y-down) -->
-    <joint name="s10_ultra_left_optical_joint" type="fixed">
-        <origin xyz="0.0 0.06 0.0" rpy="-1.5708 0.0 -1.5708"/>
-        <parent link="s10_ultra_link"/>
-        <child link="s10_ultra_left_optical"/>
-    </joint>
-    <link name="s10_ultra_left_optical"/>
-
-    <joint name="s10_ultra_right_optical_joint" type="fixed">
-        <origin xyz="0.0 -0.06 0.0" rpy="-1.5708 0.0 -1.5708"/>
-        <parent link="s10_ultra_link"/>
-        <child link="s10_ultra_right_optical"/>
-    </joint>
-    <link name="s10_ultra_right_optical"/>
+    <!-- S10 Ultra Camera TF is NOT in URDF.
+         lx_camera_ros driver broadcasts: base_link -> mrdvs_tof
+         using install params (x,y,z,roll,pitch,yaw) in its launch file. -->
 
 </robot>
