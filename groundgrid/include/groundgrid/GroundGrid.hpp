@@ -66,8 +66,8 @@ class GroundGrid {
     void init(const nav_msgs::msg::Odometry::ConstSharedPtr &inOdom);
     std::shared_ptr<grid_map::GridMap> update(const nav_msgs::msg::Odometry::ConstSharedPtr& inOdom);
 
-    const float mResolution = .33f;
-    const float mDimension = 120.0f;
+    const float mResolution = .30f;
+    const float mDimension = 20.0f;
 
    private:
     // tf

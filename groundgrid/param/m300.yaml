@@ -4,6 +4,8 @@
 # Tuned for mountain terrain
 groundgrid_node:
   ros__parameters:
+    groundgrid/dataset_name: "live"
+    groundgrid/sensor: "Avia"
     groundgrid/point_count_cell_variance_thres: 10
     groundgrid/max_ring: 1024
     groundgrid/groundpatch_detection_minimum_thres: 0.01
@@ -19,4 +21,4 @@ groundgrid_node:
     groundgrid/min_outlier_detection_ground_confidence: 0.5
     groundgrid/max_threads: 4
     groundgrid/horizontal_point_ang_dist: 0.0031
-    groundgrid/min_dist_squared: 4.0
+    groundgrid/min_dist_squared: 0.25

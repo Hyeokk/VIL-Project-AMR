@@ -38,7 +38,6 @@ def generate_launch_description():
         name='groundgrid_node',
         output='screen',
         parameters=[
-            {'groundgrid/dataset_name': 'live'},
             {'use_sim_time': False},
             {'groundgrid/visualize': False},
             {'groundgrid/evaluation': False},

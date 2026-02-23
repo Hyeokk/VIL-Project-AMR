@@ -51,7 +51,7 @@ public:
 
         // Publisher
         pub_merged_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            merged_topic, rclcpp::SensorDataQoS());
+            merged_topic, rclcpp::SystemDefaultsQoS());
 
         RCLCPP_INFO(this->get_logger(),
             "CloudMerger: M300(%s) + S10(%s) → %s [frame: %s]",
@@ -115,20 +115,15 @@ private:
     // M300 callback drives the merge pipeline
     void m300_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
     {
-        // Convert M300 (PointXYZINormal) → PointXYZI
+        // Read M300 as PointXYZI (works with both PointXYZI and PointXYZINormal input)
         pcl::PointCloud<pcl::PointXYZI>::Ptr merged(new pcl::PointCloud<pcl::PointXYZI>);
 
-        pcl::PointCloud<pcl::PointXYZINormal> m300_raw;
+        pcl::PointCloud<pcl::PointXYZI> m300_raw;
         pcl::fromROSMsg(*msg, m300_raw);
 
         merged->points.reserve(m300_raw.points.size() + 40000);
         for (const auto &pt : m300_raw.points) {
-            pcl::PointXYZI p;
-            p.x = pt.x;
-            p.y = pt.y;
-            p.z = pt.z;
-            p.intensity = pt.intensity;
-            merged->points.push_back(p);
+            merged->points.push_back(pt);
         }
 
         // Try to merge S10 Ultra
