@@ -118,6 +118,15 @@ python3 test/test_monitor.py
 
 ---
 
+## Docs
+
+| Document | Description |
+|----------|-------------|
+| [docs/Network.md](docs/Network.md) | IQ-9075 network setup: WiFi + LiDAR + Camera routing |
+| [docs/Monitoring.md](docs/Monitoring.md) | Remote rviz2 visualization via Docker (Jazzy + CycloneDDS) |
+
+---
+
 ## License
 
 Each package retains its original license. See individual package directories.
