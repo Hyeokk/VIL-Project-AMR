@@ -1,177 +1,184 @@
 # Remote Monitoring Guide
 
-> Visualize IQ-9075 (ROS2 Jazzy) sensor data with rviz2 on a laptop
+> Visualize IQ-9075 (ROS2 Jazzy) sensor data with rviz2 on Host PC
 
-## Problem
+## Background
 
-- IQ-9075 runs **ROS2 Jazzy**
-- Laptop runs **Ubuntu 22.04 / ROS2 Humble**
-- Humble and Jazzy are **NOT cross-compatible** over DDS
-- SSH alone cannot display rviz2 efficiently
+- IQ-9075: **ROS2 Jazzy** / Host PC: **ROS2 Humble**
+- Jazzy and Humble are **NOT DDS-compatible** -- direct communication fails
+- Solution: Run a **ROS2 Jazzy Docker container** on the Host PC
+- rviz2 runs inside Docker, displayed on Host PC screen via X11
 
-## Solution
+## Requirements
 
-Run a **ROS2 Jazzy Docker container** with **CycloneDDS** on the laptop. The container shares the host network (`--net=host`), discovers IQ-9075 topics over WiFi, and renders rviz2 on the laptop display via X11.
+Three settings **must match** on both sides for communication:
 
-```
- Laptop (Ubuntu 22.04)                    IQ-9075
-+-----------------------------+          +--------------+
-|  Docker (ROS2 Jazzy)        |   WiFi   |  ROS2 Jazzy  |
-|  CycloneDDS, DOMAIN_ID=7   | <------> |  CycloneDDS  |
-|  rviz2 / rqt / topic echo  |   DDS    |  DOMAIN_ID=7 |
-+-------------+---------------+          +--------------+
-              | X11
-              v
-        Laptop Display
-```
+| Setting | Value |
+|---------|-------|
+| `RMW_IMPLEMENTATION` | `rmw_cyclonedds_cpp` |
+| `ROS_DOMAIN_ID` | `64` |
+| `CYCLONEDDS_URI` | Path to `cyclonedds.xml` containing each device's WiFi IP |
+
+- Without `cyclonedds.xml`, DDS may use the wrong interface (e.g. sensor Ethernet) and discovery fails
 
 ## Files
 
 ```
 docs/docker/
-  Dockerfile.jazzy-cyclone   # Jazzy + CycloneDDS image
-  run_jazzy.sh               # Container launch script
+  Dockerfile.jazzy-cyclone    # Docker image: ROS2 Jazzy + CycloneDDS
+  cyclonedds.xml              # DDS config template (change IP only)
+  run_jazzy.sh                # Container launch script
 ```
 
 ---
 
-## Laptop Setup
+## Host PC Setup
 
-### 1. Build Docker image
+### 1. Install Docker (once)
 
 ```bash
-cd docs/docker
+sudo apt update
+sudo apt install -y docker.io
+sudo usermod -aG docker $USER
+# Log out and back in
+```
+
+### 2. Build Docker image (once)
+
+```bash
+cd <repo>/docs/docker/
 docker build -f Dockerfile.jazzy-cyclone -t jazzy-desktop-cyclone .
 ```
 
-`Dockerfile.jazzy-cyclone`:
-```dockerfile
-FROM osrf/ros:jazzy-desktop
-RUN apt-get update && apt-get install -y \
-    ros-jazzy-rmw-cyclonedds-cpp ros-jazzy-cyclonedds \
- && rm -rf /var/lib/apt/lists/*
+### 3. Edit cyclonedds.xml
+
+Find your Host PC WiFi IP:
+```bash
+ip addr show | grep "inet 192"
 ```
 
-### 2. Launch container
+Edit `<repo>/docs/docker/cyclonedds.xml` -- replace `NetworkInterfaceAddress` with your WiFi IP:
+
+```xml
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config">
+    <Domain id="any">
+        <General>
+            <NetworkInterfaceAddress>HOST_PC_WIFI_IP</NetworkInterfaceAddress>
+            <AllowMulticast>true</AllowMulticast>
+        </General>
+    </Domain>
+</CycloneDDS>
+```
+
+- Example: `192.168.0.34`
+
+### 4. Launch container
 
 ```bash
+cd <repo>/docs/docker/
+chmod +x run_jazzy.sh    # once
 ./run_jazzy.sh
 ```
 
-`run_jazzy.sh`:
-```bash
-#!/bin/bash
-xhost +local:root
-
-docker run -it --rm \
-  --net=host \
-  --ipc=host \
-  --privileged \
-  -e DISPLAY=$DISPLAY \
-  -e QT_X11_NO_MITSHM=1 \
-  -e XDG_RUNTIME_DIR=/tmp/runtime-root \
-  -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
-  -e ROS_DOMAIN_ID=7 \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-  jazzy-desktop-cyclone
-```
-
-### 3. Inside the container
+### 5. Inside the container
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-ros2 topic list       # verify IQ-9075 topics appear
-rviz2                 # launch visualization
+ros2 topic list
 ```
+
+- If IQ-9075 topics appear, connection is working
 
 ---
 
 ## IQ-9075 Setup
 
-Both machines must match **RMW** and **DOMAIN_ID**.
-
-### 1. Install CycloneDDS
+### 1. Install CycloneDDS (once)
 
 ```bash
 sudo apt install ros-jazzy-rmw-cyclonedds-cpp
 ```
 
-### 2. Set environment variables
+### 2. Create cyclonedds.xml
 
-Add to `~/.bashrc`:
-
+Find IQ-9075 WiFi IP:
 ```bash
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-export ROS_DOMAIN_ID=7
+ip addr show wlp1s0 | grep "inet "
 ```
 
-Then reload:
+Copy `<repo>/docs/docker/cyclonedds.xml` to `~/cyclonedds.xml` and change the IP to IQ-9075's WiFi IP:
 
 ```bash
+cp <repo>/docs/docker/cyclonedds.xml ~/cyclonedds.xml
+nano ~/cyclonedds.xml
+```
+
+```xml
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config">
+    <Domain id="any">
+        <General>
+            <NetworkInterfaceAddress>IQ9075_WIFI_IP</NetworkInterfaceAddress>
+            <AllowMulticast>true</AllowMulticast>
+        </General>
+    </Domain>
+</CycloneDDS>
+```
+
+- Example: `192.168.0.78`
+
+### 3. Set environment variables (persistent)
+
+```bash
+sed -i '/RMW_IMPLEMENTATION/d' ~/.bashrc
+sed -i '/ROS_DOMAIN_ID/d' ~/.bashrc
+sed -i '/CYCLONEDDS_URI/d' ~/.bashrc
+
+echo 'export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp' >> ~/.bashrc
+echo 'export ROS_DOMAIN_ID=64' >> ~/.bashrc
+echo 'export CYCLONEDDS_URI=file://$HOME/cyclonedds.xml' >> ~/.bashrc
+
 source ~/.bashrc
 ```
 
-### 3. Verify DDS uses WiFi interface
-
-If topics are not discovered, restrict CycloneDDS to the WiFi interface:
+### 4. Verify
 
 ```bash
-cat << 'EOF' > ~/cyclonedds.xml
-<?xml version="1.0" encoding="UTF-8"?>
-<CycloneDDS>
-  <Domain>
-    <General>
-      <Interfaces>
-        <NetworkInterface name="wlp1s0" />
-      </Interfaces>
-    </General>
-  </Domain>
-</CycloneDDS>
-EOF
+echo $RMW_IMPLEMENTATION    # rmw_cyclonedds_cpp
+echo $ROS_DOMAIN_ID         # 64
+echo $CYCLONEDDS_URI        # file:///home/ubuntu/cyclonedds.xml
 ```
 
-Add to `~/.bashrc`:
+- All three must print values
+- If any is blank, repeat Step 3
 
+---
+
+## Verification
+
+IQ-9075:
 ```bash
-export CYCLONEDDS_URI=file://$HOME/cyclonedds.xml
+ros2 topic pub /test std_msgs/String '{data: "hello"}' --rate 1
 ```
 
-This ensures DDS discovery traffic goes through WiFi (`wlp1s0`), not the sensor Ethernet (`end0`).
+Host PC (inside Docker):
+```bash
+source /opt/ros/jazzy/setup.bash
+ros2 topic list        # /test should appear
+ros2 topic echo /test  # should print: data: "hello"
+```
 
 ---
 
 ## Usage
 
-### View point cloud in rviz2
-
-Inside the Docker container:
+Inside Host PC Docker container:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
 rviz2
 ```
 
-In rviz2:
-1. Add > By topic > select PointCloud2 topic
-2. Set Fixed Frame to the appropriate frame (e.g. `odom` or `body`)
-
-### Monitor from terminal
-
-```bash
-ros2 topic list
-ros2 topic hz /cloud_registered_body
-ros2 topic echo /imu/data --once
-rqt
-```
-
----
-
-## Troubleshooting
-
-| Issue | Check | Fix |
-|-------|-------|-----|
-| `ros2 topic list` empty | Same WiFi? Same DOMAIN_ID? Same RMW? | Verify all three match |
-| rviz2 crash / black screen | GPU driver | Remove `-v /dev/dri:/dev/dri` or add `-e QT_QUICK_BACKEND=software` |
-| "cannot open display" | X11 not forwarded | Run `xhost +local:root` on host |
-| Topics visible but no data | DDS on wrong interface | Apply `cyclonedds.xml` (IQ-9075 Setup Step 3) |
-| High latency on point cloud | WiFi bandwidth | Reduce publish rate or downsample |
+- Add > By topic > select PointCloud2 topic
+- Set Fixed Frame (e.g. `odom`, `body`)
