@@ -482,9 +482,8 @@ void LxCamera::Run() {
             lidarCloud->height = 1;
             lidarCloud->is_dense = true;  
             pcl::toROSMsg(*lidarCloud, msg_lidarCloud);
-            int64_t ns = static_cast<int64_t>(data->timebase) * 1000;
-            msg_lidarCloud.header.stamp.sec = ns / 1000000000LL;
-            msg_lidarCloud.header.stamp.nanosec = ns % 1000000000LL;
+            // Use system clock for ROS2 TF compatibility
+            msg_lidarCloud.header.stamp = now;
             msg_lidarCloud.header.frame_id = "mrdvs_tof";
             pub_lidarCloud_->publish(msg_lidarCloud);
           }
@@ -525,12 +524,8 @@ void LxCamera::Run() {
             cloud->height = 1; 
             cloud->is_dense = true; 
             pcl::toROSMsg(*cloud, msg_cloud);
-            int64_t nanoseconds = static_cast<int64_t>(
-                one_frame->depth_data.sensor_timestamp * 1e3);
-            msg_cloud.header.stamp.sec = nanoseconds / 1e9;
-
-            msg_cloud.header.stamp.nanosec =
-                nanoseconds % static_cast<int64_t>(1e9);
+            // Use system clock for ROS2 TF compatibility
+            msg_cloud.header.stamp = now;
             msg_cloud.header.frame_id = "mrdvs_tof";
             pub_cloud_->publish(msg_cloud);
           }
@@ -627,11 +622,11 @@ void LxCamera::Run() {
     fr.temperature = temp;
     pub_temper_->publish(fr);
 
-    // pub TF
-    tf_ext_base_tof.header.stamp = now;
-    tf_ext_base_tof.header.frame_id = "base_link";
-    tf_ext_base_tof.child_frame_id = "mrdvs_tof";
-    PubTf(tf_ext_base_tof);
+    // TF is handled by static_transform_publisher in cloud_merger.launch.py
+    // tf_ext_base_tof.header.stamp = now;
+    // tf_ext_base_tof.header.frame_id = "base_link";
+    // tf_ext_base_tof.child_frame_id = "mrdvs_tof";
+    // PubTf(tf_ext_base_tof);
     if ((is_xyz_ || is_depth_ || is_amp_) && is_rgb_) {
       tf_ext_tof_rgb.header.stamp = now;
       tf_ext_tof_rgb.header.frame_id = "mrdvs_tof";

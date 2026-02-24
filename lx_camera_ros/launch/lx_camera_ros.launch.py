@@ -32,11 +32,21 @@ def generate_launch_description():
                 {"LX_BOOL_ENABLE_3D_AMP_STREAM": 0},
                 {"LX_BOOL_ENABLE_2D_STREAM": 1},
                 {"LX_BOOL_ENABLE_IMU": 0},
+
+                # --- Point Cloud Settings ---
                 # Unit: 0=mm, 1=meters (ROS2 requires meters)
                 {"LX_INT_XYZ_UNIT": 1},
+                # Coordinate: 0=camera(right/down/fwd), 1=robot(fwd/left/up)
+                {"LX_INT_XYZ_COORDINATE": 1},
+
+                # --- Undistortion ---
+                {"LX_BOOL_ENABLE_2D_UNDISTORT": 1},
+                {"LX_INT_2D_UNDISTORT_SCALE": 1},
+                {"LX_BOOL_ENABLE_3D_UNDISTORT": 1},
+                {"LX_INT_3D_UNDISTORT_SCALE": 1},
 
                 # --- Install position: S10 Ultra relative to base_link ---
-                # Driver broadcasts TF: base_link -> mrdvs_tof
+                # No rotation needed: SDK outputs in robot coordinate (fwd/left/up)
                 {"x": 0.35},
                 {"y": 0.0},
                 {"z": 0.35},
