@@ -15,4 +15,6 @@ docker run -it --rm \
   -e CYCLONEDDS_URI=file:///tmp/cyclonedds.xml \
   -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
   -v $SCRIPT_DIR/cyclonedds.xml:/tmp/cyclonedds.xml:ro \
-  jazzy-desktop-cyclone
+  -v $SCRIPT_DIR/monitor.rviz:/tmp/monitor.rviz:ro \
+  jazzy-desktop-cyclone \
+  bash -c "source /opt/ros/jazzy/setup.bash && rviz2 -d /tmp/monitor.rviz"

@@ -27,6 +27,7 @@ Three settings **must match** on both sides for communication:
 docs/docker/
   Dockerfile.jazzy-cyclone    # Docker image: ROS2 Jazzy + CycloneDDS
   cyclonedds.xml              # DDS config template (change IP only)
+  monitor.rviz                # Saved rviz2 layout (auto-loaded on launch)
   run_jazzy.sh                # Container launch script
 ```
 
@@ -73,7 +74,7 @@ Edit `<repo>/docs/docker/cyclonedds.xml` -- replace `NetworkInterfaceAddress` wi
 
 - Example: `192.168.0.34`
 
-### 4. Launch container
+### 4. Launch
 
 ```bash
 cd <repo>/docs/docker/
@@ -81,14 +82,7 @@ chmod +x run_jazzy.sh    # once
 ./run_jazzy.sh
 ```
 
-### 5. Inside the container
-
-```bash
-source /opt/ros/jazzy/setup.bash
-ros2 topic list
-```
-
-- If IQ-9075 topics appear, connection is working
+`run_jazzy.sh` launches rviz2 automatically with the saved `monitor.rviz` config.
 
 ---
 
@@ -171,14 +165,25 @@ ros2 topic echo /test  # should print: data: "hello"
 
 ---
 
-## Usage
+## rviz2 Config
 
-Inside Host PC Docker container:
+### Save
+
+`run_jazzy.sh` includes `--rm` flag, so the container is deleted on exit. Save the config **before exiting**:
+
+1. In rviz2: File > Save Config As > `/tmp/monitor.rviz`
+2. Open a **new terminal on Host PC** (do not exit the container):
 
 ```bash
-source /opt/ros/jazzy/setup.bash
-rviz2
+docker cp $(docker ps -q):/tmp/monitor.rviz <repo>/docs/docker/monitor.rviz
 ```
 
-- Add > By topic > select PointCloud2 topic
-- Set Fixed Frame (e.g. `odom`, `body`)
+### Update
+
+To update the saved config, repeat the same steps. The new `monitor.rviz` will overwrite the old one.
+
+### Launch behavior
+
+- `run_jazzy.sh` mounts `<repo>/docs/docker/monitor.rviz` into the container
+- rviz2 launches automatically with this config
+- If `monitor.rviz` does not exist, rviz2 opens with default settings
