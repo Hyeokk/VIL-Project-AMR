@@ -1,7 +1,18 @@
+# ROS2 / colcon
 build/
 install/
 log/
+
+# Python
 __pycache__/
 *.pyc
+
+# Data
 *.pcd
+*.bag
+
+# OS / Editor
 .DS_Store
+*.swp
+*~
+.vscode/
