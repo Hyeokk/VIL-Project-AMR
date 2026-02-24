@@ -28,7 +28,7 @@ def generate_launch_description():
 
     robot_yaml = LaunchConfiguration('robot_yaml',
         default=os.path.join(robot_dir, 'param', ROBOT_MODEL + '.yaml'))
-    publish_tf = LaunchConfiguration('publish_tf', default='true')
+    publish_tf = LaunchConfiguration('publish_tf', default='false')
     urdf_file = os.path.join(desc_dir, 'urdf', ROBOT_MODEL + '.urdf')
 
     with open(urdf_file, 'r') as f:

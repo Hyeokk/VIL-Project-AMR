@@ -1,7 +1,7 @@
 robot_control:
   ros__parameters:
     port:
-      name: "/dev/ttyMCU"
+      name: "/dev/ttyUSB0"
       baudrate: 115200
 
     wheel:
