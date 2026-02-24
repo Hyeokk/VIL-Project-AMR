@@ -39,7 +39,7 @@ def generate_launch_description():
         output='screen',
         parameters=[
             {'use_sim_time': False},
-            {'groundgrid/visualize': False},
+            {'groundgrid/visualize': True},
             {'groundgrid/evaluation': False},
             config,
         ],
