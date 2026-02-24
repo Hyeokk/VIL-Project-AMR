@@ -7,6 +7,9 @@
 //
 // Output: PointXYZI in body frame at 10Hz (driven by M300 rate)
 // If S10 Ultra is unavailable, M300 passes through alone.
+//
+// NOTE: M300 uses sensor-internal clock, S10 Ultra uses system clock.
+//       Staleness is checked via wall-clock receive time, not message stamps.
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -17,6 +20,7 @@
 #include <pcl/common/transforms.h>
 #include <Eigen/Geometry>
 #include <mutex>
+#include <chrono>
 
 class CloudMergerNode : public rclcpp::Node
 {
@@ -60,11 +64,12 @@ public:
     }
 
 private:
-    // Store latest S10 Ultra cloud
+    // Store latest S10 Ultra cloud with wall-clock receive time
     void s10_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
     {
         std::lock_guard<std::mutex> lock(s10_mutex_);
         latest_s10_ = msg;
+        s10_recv_time_ = std::chrono::steady_clock::now();
         s10_received_ = true;
 
         // Cache static TF on first receive
@@ -79,17 +84,8 @@ private:
                     tf.transform.rotation.x,
                     tf.transform.rotation.y,
                     tf.transform.rotation.z);
-                tf_s10_to_body_ = Eigen::Affine3f::Identity();
-                tf_s10_to_body_.rotate(q.toRotationMatrix());
-                tf_s10_to_body_.translate(Eigen::Vector3f(
-                    tf.transform.translation.x,
-                    tf.transform.translation.y,
-                    tf.transform.translation.z));
 
-                // Correct: rotation then translation means T = [R|t]
-                // But Eigen Affine: rotate then translate means T' = R * T_translate
-                // We need: p_body = R * p_s10 + t
-                // So: tf_s10_to_body_ = Translation(t) * Rotation(R)
+                // p_body = R * p_s10 + t
                 tf_s10_to_body_ = Eigen::Affine3f::Identity();
                 tf_s10_to_body_.translation() = Eigen::Vector3f(
                     tf.transform.translation.x,
@@ -128,15 +124,14 @@ private:
 
         // Try to merge S10 Ultra
         bool s10_merged = false;
+        size_t s10_count = 0;
         {
             std::lock_guard<std::mutex> lock(s10_mutex_);
             if (s10_received_ && tf_cached_ && latest_s10_) {
-                // Check staleness
-                double s10_time = latest_s10_->header.stamp.sec
-                                + latest_s10_->header.stamp.nanosec * 1e-9;
-                double m300_time = msg->header.stamp.sec
-                                 + msg->header.stamp.nanosec * 1e-9;
-                double dt = std::abs(m300_time - s10_time);
+                // Check staleness using wall-clock receive time
+                // (M300 and S10 use different clock domains)
+                auto now = std::chrono::steady_clock::now();
+                double dt = std::chrono::duration<double>(now - s10_recv_time_).count();
 
                 if (dt < s10_stale_sec_) {
                     // Convert S10 (PointXYZRGB) → PointXYZI, apply TF
@@ -162,7 +157,11 @@ private:
                         p.intensity = 0.299f * pt.r + 0.587f * pt.g + 0.114f * pt.b;
                         merged->points.push_back(p);
                     }
+                    s10_count = merged->points.size() - m300_raw.points.size();
                     s10_merged = true;
+                } else {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                        "S10 cloud stale: %.3fs ago (threshold: %.1fs)", dt, s10_stale_sec_);
                 }
             }
         }
@@ -179,11 +178,9 @@ private:
         pub_merged_->publish(out_msg);
 
         if (s10_merged) {
-            RCLCPP_DEBUG(this->get_logger(),
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                 "Merged: M300(%zu) + S10(%zu) = %zu pts",
-                m300_raw.points.size(),
-                merged->points.size() - m300_raw.points.size(),
-                merged->points.size());
+                m300_raw.points.size(), s10_count, merged->points.size());
         }
     }
 
@@ -201,6 +198,7 @@ private:
     // S10 Ultra latest cloud
     std::mutex s10_mutex_;
     sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_s10_;
+    std::chrono::steady_clock::time_point s10_recv_time_;
     bool s10_received_ = false;
 
     // Config
