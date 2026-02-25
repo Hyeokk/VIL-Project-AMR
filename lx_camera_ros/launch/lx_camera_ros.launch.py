@@ -47,9 +47,9 @@ def generate_launch_description():
 
                 # --- Install position: S10 Ultra relative to base_link ---
                 # No rotation needed: SDK outputs in robot coordinate (fwd/left/up)
-                {"x": 0.35},
+                {"x": 0.0},
                 {"y": 0.0},
-                {"z": 0.35},
+                {"z": 0.0},
                 {"roll": 0.0},
                 {"pitch": 0.0},
                 {"yaw": 0.0},
