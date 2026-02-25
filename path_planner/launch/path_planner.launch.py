@@ -17,7 +17,12 @@
 #
 # Usage:
 #   ros2 launch path_planner path_planner.launch.py
-#   ros2 launch path_planner path_planner.launch.py max_lin_vel:=0.3
+#
+# Speed configuration:
+#   All parameters are loaded from param/path_planner.yaml.
+#   To change speed, edit the yaml file directly.
+#   Runtime override:
+#     ros2 param set /path_planner_node max_lin_vel 0.3
 
 import os
 import launch
@@ -29,21 +34,6 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory('path_planner')
     config = os.path.join(pkg_dir, 'param', 'path_planner.yaml')
 
-    args = [
-        launch.actions.DeclareLaunchArgument(
-            'max_lin_vel', default_value='0.6',
-            description='Maximum linear velocity [m/s]'
-        ),
-        launch.actions.DeclareLaunchArgument(
-            'max_ang_vel', default_value='0.5',
-            description='Maximum angular velocity [rad/s]'
-        ),
-        launch.actions.DeclareLaunchArgument(
-            'control_rate', default_value='10.0',
-            description='Control loop rate [Hz]'
-        ),
-    ]
-
     path_planner_node = launch_ros.actions.Node(
         package='path_planner',
         executable='path_planner_node',
@@ -52,18 +42,9 @@ def generate_launch_description():
         parameters=[
             {'use_sim_time': False},
             config,
-            {
-                'max_lin_vel': launch.substitutions.LaunchConfiguration('max_lin_vel'),
-                'max_ang_vel': launch.substitutions.LaunchConfiguration('max_ang_vel'),
-                'control_rate': launch.substitutions.LaunchConfiguration('control_rate'),
-            },
-        ],
-        remappings=[
-            # Remap if needed (e.g., namespaced topics)
-            # ('cmd_vel', '/cmd_vel'),
         ],
     )
 
-    ld = launch.LaunchDescription(args)
+    ld = launch.LaunchDescription()
     ld.add_action(path_planner_node)
     return ld
