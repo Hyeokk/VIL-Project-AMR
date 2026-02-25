@@ -1,0 +1,20 @@
+# cloud_merger parameters
+cloud_merger:
+  ros__parameters:
+    # Topics
+    m300_topic: "/cloud_registered_body"
+    s10_topic: "/lx_camera_node/LxCamera_Cloud"
+    merged_topic: "/merged_cloud"
+    output_frame: "body"
+
+    # S10 Ultra staleness threshold [s]
+    s10_stale_threshold: 0.5
+
+    # Height filter (ground-referenced)
+    # Removes points above max_height_from_ground to filter ceiling/sky
+    # sensor_height: body frame (M300 LiDAR) height from ground
+    # Example: max_height_from_ground=2.0, sensor_height=0.63
+    #          → body frame z > 1.37m gets removed
+    enable_height_filter: true
+    max_height_from_ground: 2.0   # [m] 지면에서 이 높이 초과 점 제거
+    sensor_height: 0.63           # [m] 센서(body frame)의 지면 위 높이

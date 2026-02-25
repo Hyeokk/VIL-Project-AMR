@@ -8,6 +8,12 @@
 // Output: PointXYZI in body frame at 10Hz (driven by M300 rate)
 // If S10 Ultra is unavailable, M300 passes through alone.
 //
+// Height filter: removes points above max_height in body frame
+// to prevent ceiling/sky points from becoming false obstacles
+// in GroundGrid (indoor, tunnel environments).
+// Only upper bound is applied; no lower bound to preserve
+// ground points on slopes and downhill terrain.
+//
 // NOTE: M300 uses sensor-internal clock, S10 Ultra uses system clock.
 //       Staleness is checked via wall-clock receive time, not message stamps.
 
@@ -21,6 +27,7 @@
 #include <Eigen/Geometry>
 #include <mutex>
 #include <chrono>
+#include <algorithm>
 
 class CloudMergerNode : public rclcpp::Node
 {
@@ -34,11 +41,25 @@ public:
         this->declare_parameter<std::string>("output_frame", "body");
         this->declare_parameter<double>("s10_stale_threshold", 0.5);  // seconds
 
+        // Height crop filter (ground-referenced)
+        // Removes ceiling/sky points before GroundGrid to prevent false obstacles
+        // sensor_height: body frame (m300_link) height from ground [m]
+        // max_height_from_ground: points above this height from ground are removed
+        // Internal threshold: max_height_from_ground - sensor_height (body frame z)
+        // Only upper bound; no lower bound to preserve ground on slopes
+        this->declare_parameter<bool>("enable_height_filter", true);
+        this->declare_parameter<double>("max_height_from_ground", 2.0);  // [m] from ground
+        this->declare_parameter<double>("sensor_height", 0.63);          // [m] body frame above ground
+
         auto m300_topic = this->get_parameter("m300_topic").as_string();
         auto s10_topic = this->get_parameter("s10_topic").as_string();
         auto merged_topic = this->get_parameter("merged_topic").as_string();
         output_frame_ = this->get_parameter("output_frame").as_string();
         s10_stale_sec_ = this->get_parameter("s10_stale_threshold").as_double();
+        enable_height_filter_ = this->get_parameter("enable_height_filter").as_bool();
+        double max_height_from_ground = this->get_parameter("max_height_from_ground").as_double();
+        double sensor_height = this->get_parameter("sensor_height").as_double();
+        max_height_body_ = max_height_from_ground - sensor_height;  // convert to body frame z
 
         // TF
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -61,6 +82,12 @@ public:
             "CloudMerger: M300(%s) + S10(%s) → %s [frame: %s]",
             m300_topic.c_str(), s10_topic.c_str(),
             merged_topic.c_str(), output_frame_.c_str());
+
+        if (enable_height_filter_) {
+            RCLCPP_INFO(this->get_logger(),
+                "Height filter enabled: max %.2fm from ground (body z <= %.2fm), sensor_height=%.2fm",
+                max_height_from_ground, max_height_body_, sensor_height);
+        }
     }
 
 private:
@@ -166,6 +193,25 @@ private:
             }
         }
 
+        // Height crop filter: remove ceiling/sky points (upper bound only)
+        // No lower bound to preserve ground points on slopes/downhill
+        if (enable_height_filter_) {
+            size_t before = merged->points.size();
+            merged->points.erase(
+                std::remove_if(merged->points.begin(), merged->points.end(),
+                    [this](const pcl::PointXYZI &pt) {
+                        return pt.z > max_height_body_;
+                    }),
+                merged->points.end());
+
+            size_t removed = before - merged->points.size();
+            if (removed > 0) {
+                RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "Height filter: removed %zu/%zu pts above body z=%.1fm",
+                    removed, before, max_height_body_);
+            }
+        }
+
         // Publish
         merged->width = merged->points.size();
         merged->height = 1;
@@ -204,6 +250,8 @@ private:
     // Config
     std::string output_frame_;
     double s10_stale_sec_;
+    bool enable_height_filter_;
+    double max_height_body_;    // computed: max_height_from_ground - sensor_height
 };
 
 int main(int argc, char **argv)

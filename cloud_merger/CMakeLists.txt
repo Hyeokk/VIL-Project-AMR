@@ -19,6 +19,6 @@ ament_target_dependencies(cloud_merger_node
     rclcpp sensor_msgs tf2_ros tf2 pcl_conversions)
 
 install(TARGETS cloud_merger_node DESTINATION lib/${PROJECT_NAME})
-install(DIRECTORY launch DESTINATION share/${PROJECT_NAME}/)
+install(DIRECTORY launch param DESTINATION share/${PROJECT_NAME}/)
 
 ament_package()
