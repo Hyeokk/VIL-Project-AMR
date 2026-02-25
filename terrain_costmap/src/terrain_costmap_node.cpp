@@ -1,877 +1,722 @@
-// path_planner_node.cpp
-// A* Global Planner + DWA Local Planner for DONKEYBOTI Caterpillar Robot
+// terrain_costmap_node.cpp
+// Generates a 3m×3m robot-centric costmap from GroundGrid output.
 //
-// Designed for:
-//   - 5m x 5m costmap, 0.1m resolution (50x50 cells)
-//   - Differential-drive (skid-steer) kinematics
-//   - Turn-in-place capability (caterpillar tracks)
-//   - Terrain-aware cost traversal
+// Inputs:
+//   /groundgrid/grid_map      (grid_map_msgs/GridMap)  — elevation, variance, confidence
+//   /groundgrid/filtered_cloud (PointCloud2)            — ground(49) + obstacle(99) labeled
+//   TF: odom → base_link chain
 //
-// Subscriptions:
-//   /terrain_costmap    (nav_msgs/OccupancyGrid)  — 50x50 traversability
-//   /goal_pose          (geometry_msgs/PoseStamped) — navigation target
+// Outputs:
+//   /terrain_costmap           (nav_msgs/OccupancyGrid) — 3m×3m traversability costmap
+//   /terrain_costmap/terrain_cloud (PointCloud2)        — accumulated terrain for debug
 //
-// Publications:
-//   /cmd_vel            (geometry_msgs/Twist)       — velocity command
-//   /path_planner/global_path     (nav_msgs/Path)  — A* path (viz)
-//   /path_planner/local_trajectory (nav_msgs/Path) — DWA best trajectory (viz)
+// Cost factors:
+//   1. Obstacle density   — non-ground points in each cell
+//   2. Slope              — elevation gradient between neighbor cells
+//   3. Roughness          — height variance within cell
+//   4. Uncertainty        — low groundpatch confidence = unknown area
 //
-// TF Required:
-//   odom → base_link  (from FAST-LIO2 or wheel odometry)
-//
-// Behavior:
-//   1. Receive goal in odom frame
-//   2. A* plans on costmap (robot-centric grid → global waypoints)
-//   3. DWA selects (v, ω) tracking A* path while avoiding obstacles
-//   4. Large heading error → DWA naturally selects turn-in-place (v≈0)
-//   5. Goal outside costmap → intermediate waypoint at costmap boundary
-//   6. No valid trajectory → emergency stop (v=0, ω=0)
+// Persistent terrain map:
+//   Ground points are accumulated in odom frame over time (sliding window)
+//   to fill sensor blind spots as the robot moves.
+//   When a costmap cell has no GroundGrid data (unknown), the accumulated
+//   terrain points are used as fallback to compute slope and roughness.
+//   This preserves previously observed terrain behind and beside the robot.
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
-#include <nav_msgs/msg/path.hpp>
-#include <geometry_msgs/msg/twist.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+
+#include <grid_map_ros/grid_map_ros.hpp>
+#include <grid_map_msgs/msg/grid_map.hpp>
+
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 
-#include <cmath>
-#include <vector>
-#include <queue>
-#include <unordered_map>
-#include <algorithm>
-#include <limits>
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/filters/crop_box.h>
+
+#include <Eigen/Core>
 #include <mutex>
+#include <cmath>
+#include <algorithm>
 
-// =========================================================================
-// Helper: normalize angle to [-π, π]
-// =========================================================================
-static inline double normalize_angle(double a)
-{
-    while (a > M_PI) a -= 2.0 * M_PI;
-    while (a < -M_PI) a += 2.0 * M_PI;
-    return a;
-}
+// Per-cell statistics from accumulated terrain points (odom frame → robot frame)
+struct TerrainCellStats {
+    int count = 0;
+    double sum_z = 0.0;
+    double sum_z2 = 0.0;
 
-// =========================================================================
-// A* grid cell
-// =========================================================================
-struct Cell {
-    int r, c;
-    bool operator==(const Cell &o) const { return r == o.r && c == o.c; }
-};
-
-struct CellHash {
-    size_t operator()(const Cell &c) const {
-        return std::hash<int>()(c.r) ^ (std::hash<int>()(c.c) << 16);
+    double mean_z() const { return count > 0 ? sum_z / count : 0.0; }
+    double variance() const {
+        if (count < 2) return 0.0;
+        double m = mean_z();
+        return std::max(0.0, sum_z2 / count - m * m);
     }
 };
 
-struct AStarEntry {
-    double f;
-    Cell cell;
-    bool operator>(const AStarEntry &o) const { return f > o.f; }
-};
-
-// =========================================================================
-// DWA trajectory candidate
-// =========================================================================
-struct Trajectory {
-    double v, w;           // linear, angular velocity
-    double score;          // evaluation score
-    std::vector<std::pair<double, double>> points;  // (x, y) for visualization
-};
-
-// =========================================================================
-// PathPlannerNode
-// =========================================================================
-class PathPlannerNode : public rclcpp::Node
+class TerrainCostmapNode : public rclcpp::Node
 {
 public:
-    PathPlannerNode() : Node("path_planner_node")
+    TerrainCostmapNode() : Node("terrain_costmap_node")
     {
         declare_parameters();
         load_parameters();
         setup_tf();
-        setup_pub_sub();
-        setup_timer();
+        setup_subscribers();
+        setup_publishers();
+
+        // Pre-allocate terrain accumulation buffer
+        terrain_cloud_ = pcl::PointCloud<pcl::PointXYZI>::Ptr(
+            new pcl::PointCloud<pcl::PointXYZI>);
+        terrain_cloud_->reserve(terrain_max_points_);
 
         RCLCPP_INFO(get_logger(),
-            "PathPlanner: costmap %dx%d (%.1fm), v=[%.2f,%.2f], w=[%.2f,%.2f]",
-            grid_cells_, grid_cells_, costmap_size_,
-            min_lin_vel_, max_lin_vel_, -max_ang_vel_, max_ang_vel_);
+            "TerrainCostmap: %.1fm x %.1fm, resolution=%.2fm, cells=%dx%d",
+            costmap_size_, costmap_size_, costmap_resolution_,
+            costmap_cells_, costmap_cells_);
         RCLCPP_INFO(get_logger(),
-            "Robot footprint: %.3fm x %.3fm (L x W) + %.2fm margin",
-            robot_length_, robot_width_, clearance_margin_);
-        RCLCPP_INFO(get_logger(),
-            "DWA: %d v x %d w = %d trajectories, sim=%.2fs, dt=%.3fs",
-            n_v_samples_, n_w_samples_, n_v_samples_ * n_w_samples_,
-            sim_time_, sim_granularity_);
+            "Weights: obstacle=%.2f, slope=%.2f, roughness=%.2f, unknown=%.2f",
+            w_obstacle_, w_slope_, w_roughness_, w_unknown_);
     }
 
 private:
-    // =====================================================================
+    // =========================================================================
     // Parameters
-    // =====================================================================
+    // =========================================================================
     void declare_parameters()
     {
-        // Costmap (must match terrain_costmap_node)
-        declare_parameter<double>("costmap_size", 5.0);
-        declare_parameter<double>("costmap_resolution", 0.1);
+        // Costmap geometry
+        this->declare_parameter<double>("costmap_size", 3.0);
+        this->declare_parameter<double>("costmap_resolution", 0.1);
+        this->declare_parameter<std::string>("robot_frame", "base_link");
+        this->declare_parameter<std::string>("odom_frame", "odom");
 
-        // Robot kinematics (DONKEYBOTI.yaml)
-        declare_parameter<double>("max_lin_vel", 0.6);
-        declare_parameter<double>("min_lin_vel", -0.2);     // limited reverse
-        declare_parameter<double>("max_ang_vel", 0.5);
-        declare_parameter<double>("max_lin_acc", 1.0);
-        declare_parameter<double>("max_ang_acc", 2.0);
+        // Cost weights (sum should be 1.0 for clarity, but not enforced)
+        this->declare_parameter<double>("weight_obstacle", 0.4);
+        this->declare_parameter<double>("weight_slope", 0.3);
+        this->declare_parameter<double>("weight_roughness", 0.15);
+        this->declare_parameter<double>("weight_unknown", 0.15);
 
-        // DWA parameters
-        declare_parameter<int>("n_v_samples", 11);
-        declare_parameter<int>("n_w_samples", 21);          // more ω for turn-in-place
-        declare_parameter<double>("sim_time", 1.5);         // forward simulation [s]
-        declare_parameter<double>("sim_granularity", 0.1);  // simulation step [s]
+        // Thresholds
+        this->declare_parameter<double>("slope_max_deg", 35.0);
+        this->declare_parameter<double>("roughness_max", 0.05);
+        this->declare_parameter<double>("obstacle_count_max", 5.0);
+        this->declare_parameter<double>("confidence_threshold", 0.1);
 
-        // DWA scoring weights
-        declare_parameter<double>("weight_heading", 1.0);   // alignment to A* path
-        declare_parameter<double>("weight_clearance", 0.5); // obstacle distance
-        declare_parameter<double>("weight_velocity", 0.3);  // prefer forward motion
-        declare_parameter<double>("weight_path_dist", 0.8); // distance to A* path
+        // Lethal cost: cells above this total cost → 100 (impassable)
+        this->declare_parameter<double>("lethal_threshold", 0.8);
 
-        // Goal tolerance
-        declare_parameter<double>("goal_xy_tolerance", 0.2);    // [m]
-        declare_parameter<double>("goal_yaw_tolerance", 0.15);  // [rad] ~8.6°
-
-        // A* configuration
-        declare_parameter<double>("astar_lethal_cost", 80.0);   // cells >= this are blocked
-        declare_parameter<double>("astar_cost_weight", 2.0);    // terrain cost penalty
-
-        // Robot footprint (rectangular — DONKEYBOTI: 0.85m x 1.432m)
-        declare_parameter<double>("robot_length", 1.432);   // [m] front-to-back (x-axis)
-        declare_parameter<double>("robot_width", 0.85);     // [m] left-to-right (y-axis)
-        declare_parameter<double>("clearance_margin", 0.1); // [m] extra safety buffer
-
-        // Control rate
-        declare_parameter<double>("control_rate", 10.0);    // [Hz]
-
-        // Frames
-        declare_parameter<std::string>("odom_frame", "odom");
-        declare_parameter<std::string>("robot_frame", "base_link");
+        // Terrain accumulation
+        this->declare_parameter<bool>("enable_terrain_accumulation", true);
+        this->declare_parameter<int>("terrain_max_points", 200000);
+        this->declare_parameter<double>("terrain_radius", 10.0);
+        this->declare_parameter<double>("terrain_publish_rate", 1.0);
 
         // Topics
-        declare_parameter<std::string>("costmap_topic", "/terrain_costmap");
-        declare_parameter<std::string>("goal_topic", "/goal_pose");
-        declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
-
-        // Slope speed reduction (IMU-based, future extension)
-        declare_parameter<double>("slope_speed_factor", 0.5);  // reduce max_v on slope
-        declare_parameter<double>("slope_threshold_deg", 15.0);
+        this->declare_parameter<std::string>("gridmap_topic", "/groundgrid/grid_map");
+        this->declare_parameter<std::string>("filtered_cloud_topic", "/groundgrid/filtered_cloud");
+        this->declare_parameter<std::string>("costmap_topic", "/terrain_costmap");
+        this->declare_parameter<std::string>("terrain_cloud_topic", "/terrain_costmap/terrain_cloud");
     }
 
     void load_parameters()
     {
         costmap_size_ = get_parameter("costmap_size").as_double();
         costmap_resolution_ = get_parameter("costmap_resolution").as_double();
-        grid_cells_ = static_cast<int>(std::round(costmap_size_ / costmap_resolution_));
-
-        max_lin_vel_ = get_parameter("max_lin_vel").as_double();
-        min_lin_vel_ = get_parameter("min_lin_vel").as_double();
-        max_ang_vel_ = get_parameter("max_ang_vel").as_double();
-        max_lin_acc_ = get_parameter("max_lin_acc").as_double();
-        max_ang_acc_ = get_parameter("max_ang_acc").as_double();
-
-        n_v_samples_ = get_parameter("n_v_samples").as_int();
-        n_w_samples_ = get_parameter("n_w_samples").as_int();
-        sim_time_ = get_parameter("sim_time").as_double();
-        sim_granularity_ = get_parameter("sim_granularity").as_double();
-
-        w_heading_ = get_parameter("weight_heading").as_double();
-        w_clearance_ = get_parameter("weight_clearance").as_double();
-        w_velocity_ = get_parameter("weight_velocity").as_double();
-        w_path_dist_ = get_parameter("weight_path_dist").as_double();
-
-        goal_xy_tol_ = get_parameter("goal_xy_tolerance").as_double();
-        goal_yaw_tol_ = get_parameter("goal_yaw_tolerance").as_double();
-
-        astar_lethal_ = get_parameter("astar_lethal_cost").as_double();
-        astar_cost_weight_ = get_parameter("astar_cost_weight").as_double();
-
-        robot_length_ = get_parameter("robot_length").as_double();
-        robot_width_ = get_parameter("robot_width").as_double();
-        clearance_margin_ = get_parameter("clearance_margin").as_double();
-
-        control_rate_ = get_parameter("control_rate").as_double();
-
-        odom_frame_ = get_parameter("odom_frame").as_string();
         robot_frame_ = get_parameter("robot_frame").as_string();
+        odom_frame_ = get_parameter("odom_frame").as_string();
 
-        slope_speed_factor_ = get_parameter("slope_speed_factor").as_double();
-        slope_threshold_deg_ = get_parameter("slope_threshold_deg").as_double();
+        w_obstacle_ = get_parameter("weight_obstacle").as_double();
+        w_slope_ = get_parameter("weight_slope").as_double();
+        w_roughness_ = get_parameter("weight_roughness").as_double();
+        w_unknown_ = get_parameter("weight_unknown").as_double();
+
+        slope_max_rad_ = get_parameter("slope_max_deg").as_double() * M_PI / 180.0;
+        roughness_max_ = get_parameter("roughness_max").as_double();
+        obstacle_count_max_ = get_parameter("obstacle_count_max").as_double();
+        confidence_threshold_ = get_parameter("confidence_threshold").as_double();
+        lethal_threshold_ = get_parameter("lethal_threshold").as_double();
+
+        enable_terrain_accum_ = get_parameter("enable_terrain_accumulation").as_bool();
+        terrain_max_points_ = get_parameter("terrain_max_points").as_int();
+        terrain_radius_ = get_parameter("terrain_radius").as_double();
+
+        costmap_cells_ = static_cast<int>(std::round(costmap_size_ / costmap_resolution_));
+
+        gridmap_topic_ = get_parameter("gridmap_topic").as_string();
+        filtered_cloud_topic_ = get_parameter("filtered_cloud_topic").as_string();
+        costmap_topic_ = get_parameter("costmap_topic").as_string();
+        terrain_cloud_topic_ = get_parameter("terrain_cloud_topic").as_string();
     }
 
-    // =====================================================================
+    // =========================================================================
     // Setup
-    // =====================================================================
+    // =========================================================================
     void setup_tf()
     {
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
     }
 
-    void setup_pub_sub()
+    void setup_subscribers()
     {
-        auto costmap_topic = get_parameter("costmap_topic").as_string();
-        auto goal_topic = get_parameter("goal_topic").as_string();
-        auto cmd_topic = get_parameter("cmd_vel_topic").as_string();
+        sub_gridmap_ = create_subscription<grid_map_msgs::msg::GridMap>(
+            gridmap_topic_, rclcpp::SensorDataQoS(),
+            std::bind(&TerrainCostmapNode::gridmap_callback, this, std::placeholders::_1));
 
-        sub_costmap_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
-            costmap_topic, rclcpp::SystemDefaultsQoS(),
-            std::bind(&PathPlannerNode::costmap_callback, this, std::placeholders::_1));
-
-        sub_goal_ = create_subscription<geometry_msgs::msg::PoseStamped>(
-            goal_topic, 10,
-            std::bind(&PathPlannerNode::goal_callback, this, std::placeholders::_1));
-
-        pub_cmd_ = create_publisher<geometry_msgs::msg::Twist>(cmd_topic, 10);
-        pub_global_path_ = create_publisher<nav_msgs::msg::Path>(
-            "/path_planner/global_path", 10);
-        pub_local_traj_ = create_publisher<nav_msgs::msg::Path>(
-            "/path_planner/local_trajectory", 10);
-    }
-
-    void setup_timer()
-    {
-        double period = 1.0 / control_rate_;
-        control_timer_ = create_wall_timer(
-            std::chrono::duration<double>(period),
-            std::bind(&PathPlannerNode::control_loop, this));
-    }
-
-    // =====================================================================
-    // Callbacks
-    // =====================================================================
-    void costmap_callback(const nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg)
-    {
-        std::lock_guard<std::mutex> lock(costmap_mutex_);
-        costmap_ = msg;
-    }
-
-    void goal_callback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
-    {
-        goal_ = *msg;
-        goal_active_ = true;
-        RCLCPP_INFO(get_logger(), "New goal: (%.2f, %.2f) in frame '%s'",
-            msg->pose.position.x, msg->pose.position.y,
-            msg->header.frame_id.c_str());
-    }
-
-    // =====================================================================
-    // Main control loop (10 Hz)
-    // =====================================================================
-    void control_loop()
-    {
-        if (!goal_active_) return;
-
-        // 1. Get latest costmap
-        nav_msgs::msg::OccupancyGrid::ConstSharedPtr costmap;
-        {
-            std::lock_guard<std::mutex> lock(costmap_mutex_);
-            costmap = costmap_;
+        if (enable_terrain_accum_) {
+            sub_filtered_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+                filtered_cloud_topic_, rclcpp::SensorDataQoS(),
+                std::bind(&TerrainCostmapNode::filtered_cloud_callback, this, std::placeholders::_1));
         }
-        if (!costmap) {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
-                "No costmap received yet");
+    }
+
+    void setup_publishers()
+    {
+        pub_costmap_ = create_publisher<nav_msgs::msg::OccupancyGrid>(
+            costmap_topic_, rclcpp::SystemDefaultsQoS());
+
+        if (enable_terrain_accum_) {
+            pub_terrain_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+                terrain_cloud_topic_, rclcpp::SystemDefaultsQoS());
+
+            double rate = get_parameter("terrain_publish_rate").as_double();
+            if (rate > 0.0) {
+                terrain_timer_ = create_wall_timer(
+                    std::chrono::duration<double>(1.0 / rate),
+                    std::bind(&TerrainCostmapNode::publish_terrain_cloud, this));
+            }
+        }
+    }
+
+    // =========================================================================
+    // GridMap callback — Main costmap generation pipeline
+    // =========================================================================
+    void gridmap_callback(const grid_map_msgs::msg::GridMap::ConstSharedPtr msg)
+    {
+        // 1. Convert message to grid_map
+        grid_map::GridMap full_map;
+        if (!grid_map::GridMapRosConverter::fromMessage(*msg, full_map)) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                "Failed to convert GridMap message");
             return;
         }
 
-        // 2. Get robot pose in odom frame
-        double robot_x, robot_y, robot_yaw;
-        if (!get_robot_pose(robot_x, robot_y, robot_yaw))
-            return;
-
-        // 3. Compute goal in robot frame
-        double goal_x_odom = goal_.pose.position.x;
-        double goal_y_odom = goal_.pose.position.y;
-        double goal_yaw = get_yaw_from_quat(goal_.pose.orientation);
-
-        double dx = goal_x_odom - robot_x;
-        double dy = goal_y_odom - robot_y;
-        double dist_to_goal = std::hypot(dx, dy);
-
-        // 4. Check if goal reached
-        if (dist_to_goal < goal_xy_tol_) {
-            double yaw_err = std::abs(normalize_angle(goal_yaw - robot_yaw));
-            if (yaw_err < goal_yaw_tol_) {
-                // Goal reached
-                publish_stop();
-                goal_active_ = false;
-                RCLCPP_INFO(get_logger(), "Goal reached!");
-                return;
-            } else {
-                // Position reached, align heading
-                double w = std::clamp(
-                    normalize_angle(goal_yaw - robot_yaw) * 1.5,
-                    -max_ang_vel_, max_ang_vel_);
-                publish_cmd(0.0, w);
-                return;
-            }
-        }
-
-        // 5. Transform goal to robot-local costmap coordinates
-        double goal_local_x =  std::cos(-robot_yaw) * dx - std::sin(-robot_yaw) * dy;
-        double goal_local_y =  std::sin(-robot_yaw) * dx + std::cos(-robot_yaw) * dy;
-
-        // 6. Project goal to costmap boundary if outside
-        double half = costmap_size_ / 2.0;
-        double margin = costmap_resolution_ * 2;
-        bool goal_in_costmap = (std::abs(goal_local_x) < half - margin &&
-                                std::abs(goal_local_y) < half - margin);
-
-        double plan_local_x = goal_local_x;
-        double plan_local_y = goal_local_y;
-        if (!goal_in_costmap) {
-            // Project to costmap boundary along direction to goal
-            double angle = std::atan2(goal_local_y, goal_local_x);
-            double boundary = half - margin;
-            plan_local_x = boundary * std::cos(angle);
-            plan_local_y = boundary * std::sin(angle);
-        }
-
-        // 7. Convert local coords to grid indices
-        int start_r = grid_cells_ / 2;
-        int start_c = grid_cells_ / 2;
-        int goal_r = static_cast<int>((plan_local_y + half) / costmap_resolution_);
-        int goal_c = static_cast<int>((plan_local_x + half) / costmap_resolution_);
-
-        goal_r = std::clamp(goal_r, 1, grid_cells_ - 2);
-        goal_c = std::clamp(goal_c, 1, grid_cells_ - 2);
-
-        // 8. A* global path
-        auto grid_path = astar_plan(costmap, {start_r, start_c}, {goal_r, goal_c});
-
-        if (grid_path.empty()) {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                "A* found no path — stopping");
-            publish_stop();
-            return;
-        }
-
-        // 9. Convert grid path to local coordinates for DWA
-        std::vector<std::pair<double, double>> waypoints;
-        waypoints.reserve(grid_path.size());
-        for (const auto &cell : grid_path) {
-            double lx = (cell.c + 0.5) * costmap_resolution_ - half;
-            double ly = (cell.r + 0.5) * costmap_resolution_ - half;
-            waypoints.emplace_back(lx, ly);
-        }
-
-        // Publish global path for visualization
-        publish_global_path(waypoints, costmap->header.stamp, robot_x, robot_y, robot_yaw);
-
-        // 10. DWA local planning
-        auto [best_v, best_w, best_traj] = dwa_plan(costmap, waypoints,
-            plan_local_x, plan_local_y);
-
-        // Publish local trajectory for visualization
-        publish_local_trajectory(best_traj, costmap->header.stamp,
-            robot_x, robot_y, robot_yaw);
-
-        // 11. Publish command
-        publish_cmd(best_v, best_w);
-    }
-
-    // =====================================================================
-    // A* Global Planner
-    // =====================================================================
-    std::vector<Cell> astar_plan(
-        const nav_msgs::msg::OccupancyGrid::ConstSharedPtr &costmap,
-        Cell start, Cell goal)
-    {
-        const int rows = costmap->info.height;
-        const int cols = costmap->info.width;
-        const auto &data = costmap->data;
-
-        // Validate start/goal
-        auto get_cost = [&](int r, int c) -> int {
-            if (r < 0 || r >= rows || c < 0 || c >= cols) return 127;
-            return data[r * cols + c];
-        };
-
-        if (get_cost(goal.r, goal.c) >= static_cast<int>(astar_lethal_)) {
-            // Goal cell is blocked — find nearest free cell
-            goal = find_nearest_free(costmap, goal);
-            if (goal.r < 0) return {};
-        }
-
-        // Priority queue
-        std::priority_queue<AStarEntry, std::vector<AStarEntry>,
-                           std::greater<AStarEntry>> open;
-        std::unordered_map<Cell, double, CellHash> g_score;
-        std::unordered_map<Cell, Cell, CellHash> came_from;
-
-        g_score[start] = 0.0;
-        open.push({heuristic(start, goal), start});
-
-        // 8-connected neighbors
-        static const int dr[] = {-1, -1, -1, 0, 0, 1, 1, 1};
-        static const int dc[] = {-1, 0, 1, -1, 1, -1, 0, 1};
-        static const double move_cost[] = {
-            M_SQRT2, 1.0, M_SQRT2, 1.0, 1.0, M_SQRT2, 1.0, M_SQRT2
-        };
-
-        while (!open.empty()) {
-            auto [f, current] = open.top();
-            open.pop();
-
-            if (current == goal) {
-                return reconstruct_path(came_from, start, goal);
-            }
-
-            // Skip if we already found a better path
-            auto it = g_score.find(current);
-            if (it != g_score.end() && f - heuristic(current, goal) > it->second + 1e-6)
-                continue;
-
-            for (int i = 0; i < 8; ++i) {
-                Cell nb = {current.r + dr[i], current.c + dc[i]};
-                if (nb.r < 0 || nb.r >= rows || nb.c < 0 || nb.c >= cols)
-                    continue;
-
-                int cell_cost = get_cost(nb.r, nb.c);
-                if (cell_cost < 0 || cell_cost >= static_cast<int>(astar_lethal_))
-                    continue;  // unknown(-1) or lethal
-
-                // Terrain-aware cost: higher cost cells are more expensive
-                double terrain_penalty = static_cast<double>(cell_cost) / 100.0
-                                       * astar_cost_weight_;
-                double tentative = g_score[current]
-                                 + move_cost[i] * (1.0 + terrain_penalty);
-
-                auto git = g_score.find(nb);
-                if (git == g_score.end() || tentative < git->second) {
-                    g_score[nb] = tentative;
-                    came_from[nb] = current;
-                    open.push({tentative + heuristic(nb, goal), nb});
-                }
-            }
-        }
-
-        return {};  // No path found
-    }
-
-    double heuristic(const Cell &a, const Cell &b) const
-    {
-        // Octile distance
-        int dx = std::abs(a.c - b.c);
-        int dy = std::abs(a.r - b.r);
-        return std::max(dx, dy) + (M_SQRT2 - 1.0) * std::min(dx, dy);
-    }
-
-    std::vector<Cell> reconstruct_path(
-        const std::unordered_map<Cell, Cell, CellHash> &came_from,
-        const Cell &start, const Cell &goal)
-    {
-        std::vector<Cell> path;
-        Cell current = goal;
-        while (!(current == start)) {
-            path.push_back(current);
-            auto it = came_from.find(current);
-            if (it == came_from.end()) break;
-            current = it->second;
-        }
-        path.push_back(start);
-        std::reverse(path.begin(), path.end());
-        return path;
-    }
-
-    Cell find_nearest_free(
-        const nav_msgs::msg::OccupancyGrid::ConstSharedPtr &costmap,
-        const Cell &target)
-    {
-        const int rows = costmap->info.height;
-        const int cols = costmap->info.width;
-        const auto &data = costmap->data;
-
-        // BFS spiral outward from target
-        for (int radius = 1; radius < std::max(rows, cols) / 2; ++radius) {
-            for (int dr = -radius; dr <= radius; ++dr) {
-                for (int dc = -radius; dc <= radius; ++dc) {
-                    if (std::abs(dr) != radius && std::abs(dc) != radius)
-                        continue;
-                    int nr = target.r + dr;
-                    int nc = target.c + dc;
-                    if (nr >= 0 && nr < rows && nc >= 0 && nc < cols) {
-                        int cost = data[nr * cols + nc];
-                        if (cost >= 0 && cost < static_cast<int>(astar_lethal_))
-                            return {nr, nc};
-                    }
-                }
-            }
-        }
-        return {-1, -1};
-    }
-
-    // =====================================================================
-    // DWA Local Planner
-    // =====================================================================
-    struct DWAResult {
-        double v, w;
-        std::vector<std::pair<double, double>> trajectory;
-    };
-
-    DWAResult dwa_plan(
-        const nav_msgs::msg::OccupancyGrid::ConstSharedPtr &costmap,
-        const std::vector<std::pair<double, double>> &global_path,
-        double goal_local_x, double goal_local_y)
-    {
-        // Dynamic window from current velocity
-        double v_min = std::max(min_lin_vel_, cur_v_ - max_lin_acc_ / control_rate_);
-        double v_max = std::min(max_lin_vel_, cur_v_ + max_lin_acc_ / control_rate_);
-        double w_min = std::max(-max_ang_vel_, cur_w_ - max_ang_acc_ / control_rate_);
-        double w_max = std::min(max_ang_vel_, cur_w_ + max_ang_acc_ / control_rate_);
-
-        const int sim_steps = static_cast<int>(std::round(sim_time_ / sim_granularity_));
-        const double half = costmap_size_ / 2.0;
-
-        double best_score = -std::numeric_limits<double>::infinity();
-        double best_v = 0.0, best_w = 0.0;
-        std::vector<std::pair<double, double>> best_traj;
-
-        // Find the lookahead point on global path
-        // (skip waypoints behind robot, target 0.3~0.5m ahead)
-        double lookahead_x = goal_local_x;
-        double lookahead_y = goal_local_y;
-        if (global_path.size() > 2) {
-            double lookahead_dist = 0.5;  // [m]
-            double accum = 0.0;
-            for (size_t i = 1; i < global_path.size(); ++i) {
-                double dx = global_path[i].first - global_path[i-1].first;
-                double dy = global_path[i].second - global_path[i-1].second;
-                accum += std::hypot(dx, dy);
-                if (accum >= lookahead_dist) {
-                    lookahead_x = global_path[i].first;
-                    lookahead_y = global_path[i].second;
-                    break;
-                }
-            }
-        }
-
-        for (int vi = 0; vi < n_v_samples_; ++vi) {
-            double v = v_min + (v_max - v_min) * vi / std::max(n_v_samples_ - 1, 1);
-
-            for (int wi = 0; wi < n_w_samples_; ++wi) {
-                double w = w_min + (w_max - w_min) * wi / std::max(n_w_samples_ - 1, 1);
-
-                // Forward simulate trajectory
-                double x = 0.0, y = 0.0, theta = 0.0;
-                bool collision = false;
-                double min_clearance = std::numeric_limits<double>::max();
-                std::vector<std::pair<double, double>> traj;
-                traj.reserve(sim_steps);
-
-                for (int s = 0; s < sim_steps; ++s) {
-                    x += v * std::cos(theta) * sim_granularity_;
-                    y += v * std::sin(theta) * sim_granularity_;
-                    theta += w * sim_granularity_;
-                    traj.emplace_back(x, y);
-
-                    // Collision check in costmap
-                    int gc = static_cast<int>((x + half) / costmap_resolution_);
-                    int gr = static_cast<int>((y + half) / costmap_resolution_);
-
-                    if (gc < 0 || gc >= grid_cells_ || gr < 0 || gr >= grid_cells_) {
-                        // Outside costmap — penalize but don't block
-                        min_clearance = std::min(min_clearance, 0.1);
-                        continue;
-                    }
-
-                    int cell_cost = costmap->data[gr * grid_cells_ + gc];
-                    if (cell_cost >= static_cast<int>(astar_lethal_)) {
-                        collision = true;
-                        break;
-                    }
-
-                    // Rectangular footprint collision check
-                    // Robot corners in local frame (with safety margin)
-                    double half_l = (robot_length_ + 2.0 * clearance_margin_) / 2.0;
-                    double half_w = (robot_width_ + 2.0 * clearance_margin_) / 2.0;
-                    double cos_t = std::cos(theta);
-                    double sin_t = std::sin(theta);
-
-                    // 4 corners of rotated rectangle centered at (x, y)
-                    double corners[4][2] = {
-                        { x + cos_t * half_l - sin_t * half_w,
-                          y + sin_t * half_l + cos_t * half_w },
-                        { x + cos_t * half_l + sin_t * half_w,
-                          y + sin_t * half_l - cos_t * half_w },
-                        { x - cos_t * half_l + sin_t * half_w,
-                          y - sin_t * half_l - cos_t * half_w },
-                        { x - cos_t * half_l - sin_t * half_w,
-                          y - sin_t * half_l + cos_t * half_w },
-                    };
-
-                    // Axis-aligned bounding box in grid coords
-                    int min_gc = grid_cells_, max_gc = 0;
-                    int min_gr = grid_cells_, max_gr = 0;
-                    for (int k = 0; k < 4; ++k) {
-                        int cc = static_cast<int>((corners[k][0] + half) / costmap_resolution_);
-                        int cr = static_cast<int>((corners[k][1] + half) / costmap_resolution_);
-                        min_gc = std::min(min_gc, cc); max_gc = std::max(max_gc, cc);
-                        min_gr = std::min(min_gr, cr); max_gr = std::max(max_gr, cr);
-                    }
-                    min_gc = std::max(0, min_gc); max_gc = std::min(grid_cells_ - 1, max_gc);
-                    min_gr = std::max(0, min_gr); max_gr = std::min(grid_cells_ - 1, max_gr);
-
-                    // Local axes of the rectangle (unit vectors)
-                    // Forward axis (length direction) and right axis (width direction)
-                    bool rect_collision = false;
-                    for (int cr = min_gr; cr <= max_gr && !rect_collision; ++cr) {
-                        for (int cc = min_gc; cc <= max_gc && !rect_collision; ++cc) {
-                            // Cell center in local coords
-                            double cx = (cc + 0.5) * costmap_resolution_ - half;
-                            double cy = (cr + 0.5) * costmap_resolution_ - half;
-                            // Project onto robot axes
-                            double dx = cx - x;
-                            double dy = cy - y;
-                            double proj_l = std::abs(dx * cos_t + dy * sin_t);
-                            double proj_w = std::abs(-dx * sin_t + dy * cos_t);
-                            if (proj_l <= half_l && proj_w <= half_w) {
-                                // Inside footprint
-                                if (costmap->data[cr * grid_cells_ + cc] >= static_cast<int>(astar_lethal_)) {
-                                    rect_collision = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if (rect_collision) {
-                        collision = true;
-                        break;
-                    }
-
-                    // Clearance as inverse of terrain cost
-                    if (cell_cost >= 0) {
-                        double cl = 1.0 - static_cast<double>(cell_cost) / 100.0;
-                        min_clearance = std::min(min_clearance, cl);
-                    }
-                }
-
-                if (collision) continue;
-
-                // === Scoring ===
-                // (a) Heading: alignment to lookahead point from trajectory end
-                double angle_to_goal = std::atan2(lookahead_y - y, lookahead_x - x);
-                double heading_err = std::abs(normalize_angle(angle_to_goal - theta));
-                double heading_score = 1.0 - heading_err / M_PI;
-
-                // (b) Clearance
-                double clearance_score = (min_clearance < std::numeric_limits<double>::max())
-                    ? min_clearance : 1.0;
-
-                // (c) Velocity: prefer forward motion
-                double velocity_score = 0.0;
-                if (max_lin_vel_ > 0.0) {
-                    velocity_score = v / max_lin_vel_;
-                    // Slight penalty for pure reverse
-                    if (v < 0.0) velocity_score *= 0.5;
-                }
-
-                // (d) Path distance: closeness to global A* path
-                double path_dist_score = 1.0;
-                if (!global_path.empty()) {
-                    double min_dist = std::numeric_limits<double>::max();
-                    for (const auto &wp : global_path) {
-                        double d = std::hypot(x - wp.first, y - wp.second);
-                        min_dist = std::min(min_dist, d);
-                    }
-                    // Normalize: 0 at 1m distance, 1 at 0m
-                    path_dist_score = std::max(0.0, 1.0 - min_dist);
-                }
-
-                double score = w_heading_ * heading_score
-                             + w_clearance_ * clearance_score
-                             + w_velocity_ * velocity_score
-                             + w_path_dist_ * path_dist_score;
-
-                if (score > best_score) {
-                    best_score = score;
-                    best_v = v;
-                    best_w = w;
-                    best_traj = traj;
-                }
-            }
-        }
-
-        // No valid trajectory found → emergency stop
-        if (best_score <= -std::numeric_limits<double>::max() + 1.0) {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                "DWA: no valid trajectory — emergency stop");
-            return {0.0, 0.0, {}};
-        }
-
-        return {best_v, best_w, best_traj};
-    }
-
-    // =====================================================================
-    // TF helpers
-    // =====================================================================
-    bool get_robot_pose(double &x, double &y, double &yaw)
-    {
+        // 2. Get robot position in odom frame via TF
+        geometry_msgs::msg::TransformStamped tf_odom_to_robot;
         try {
-            auto tf = tf_buffer_->lookupTransform(
-                odom_frame_, robot_frame_, tf2::TimePointZero,
+            tf_odom_to_robot = tf_buffer_->lookupTransform(
+                odom_frame_, robot_frame_,
+                msg->header.stamp,
                 tf2::durationFromSec(0.1));
-            x = tf.transform.translation.x;
-            y = tf.transform.translation.y;
-            yaw = get_yaw_from_tf(tf.transform.rotation);
-            return true;
         } catch (tf2::TransformException &ex) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
-                "TF lookup failed: %s", ex.what());
-            return false;
-        }
-    }
-
-    static double get_yaw_from_tf(const geometry_msgs::msg::Quaternion &q)
-    {
-        tf2::Quaternion tq(q.x, q.y, q.z, q.w);
-        double r, p, y;
-        tf2::Matrix3x3(tq).getRPY(r, p, y);
-        return y;
-    }
-
-    static double get_yaw_from_quat(const geometry_msgs::msg::Quaternion &q)
-    {
-        return get_yaw_from_tf(q);
-    }
-
-    // =====================================================================
-    // Publishing
-    // =====================================================================
-    void publish_cmd(double v, double w)
-    {
-        cur_v_ = v;
-        cur_w_ = w;
-        geometry_msgs::msg::Twist cmd;
-        cmd.linear.x = v;
-        cmd.angular.z = w;
-        pub_cmd_->publish(cmd);
-    }
-
-    void publish_stop()
-    {
-        publish_cmd(0.0, 0.0);
-    }
-
-    void publish_global_path(
-        const std::vector<std::pair<double, double>> &waypoints,
-        const rclcpp::Time &stamp,
-        double robot_x, double robot_y, double robot_yaw)
-    {
-        if (pub_global_path_->get_subscription_count() == 0) return;
-
-        nav_msgs::msg::Path path_msg;
-        path_msg.header.stamp = stamp;
-        path_msg.header.frame_id = odom_frame_;
-
-        double cos_y = std::cos(robot_yaw);
-        double sin_y = std::sin(robot_yaw);
-
-        for (const auto &[lx, ly] : waypoints) {
-            geometry_msgs::msg::PoseStamped ps;
-            ps.header = path_msg.header;
-            // Local → odom
-            ps.pose.position.x = cos_y * lx - sin_y * ly + robot_x;
-            ps.pose.position.y = sin_y * lx + cos_y * ly + robot_y;
-            ps.pose.position.z = 0.0;
-            ps.pose.orientation.w = 1.0;
-            path_msg.poses.push_back(ps);
+                "TF %s → %s failed: %s", odom_frame_.c_str(), robot_frame_.c_str(), ex.what());
+            return;
         }
 
-        pub_global_path_->publish(path_msg);
-    }
+        const double robot_x = tf_odom_to_robot.transform.translation.x;
+        const double robot_y = tf_odom_to_robot.transform.translation.y;
 
-    void publish_local_trajectory(
-        const std::vector<std::pair<double, double>> &traj,
-        const rclcpp::Time &stamp,
-        double robot_x, double robot_y, double robot_yaw)
-    {
-        if (pub_local_traj_->get_subscription_count() == 0) return;
-        if (traj.empty()) return;
-
-        nav_msgs::msg::Path traj_msg;
-        traj_msg.header.stamp = stamp;
-        traj_msg.header.frame_id = odom_frame_;
-
-        double cos_y = std::cos(robot_yaw);
-        double sin_y = std::sin(robot_yaw);
-
-        for (const auto &[lx, ly] : traj) {
-            geometry_msgs::msg::PoseStamped ps;
-            ps.header = traj_msg.header;
-            ps.pose.position.x = cos_y * lx - sin_y * ly + robot_x;
-            ps.pose.position.y = sin_y * lx + cos_y * ly + robot_y;
-            ps.pose.position.z = 0.0;
-            ps.pose.orientation.w = 1.0;
-            traj_msg.poses.push_back(ps);
+        // 3. Check if robot position is inside the GridMap
+        grid_map::Position robot_pos(robot_x, robot_y);
+        if (!full_map.isInside(robot_pos)) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+                "Robot position (%.2f, %.2f) is outside GridMap", robot_x, robot_y);
+            return;
         }
 
-        pub_local_traj_->publish(traj_msg);
+        // 4. Extract robot yaw for coordinate transform
+        tf2::Quaternion q;
+        tf2::fromMsg(tf_odom_to_robot.transform.rotation, q);
+        double roll, pitch, yaw;
+        tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+        cos_yaw_ = std::cos(yaw);
+        sin_yaw_ = std::sin(yaw);
+
+        // 5. Extract submap around robot
+        bool success = false;
+        grid_map::GridMap submap = full_map.getSubmap(
+            robot_pos,
+            grid_map::Length(costmap_size_, costmap_size_),
+            success);
+
+        if (!success) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+                "Failed to extract submap at (%.2f, %.2f)", robot_x, robot_y);
+            return;
+        }
+
+        // 6. Generate costmap from submap layers
+        auto costmap_msg = generate_costmap(submap, tf_odom_to_robot);
+        pub_costmap_->publish(*costmap_msg);
     }
 
-    // =====================================================================
+    // =========================================================================
+    // Costmap generation from GridMap submap
+    // =========================================================================
+    nav_msgs::msg::OccupancyGrid::UniquePtr generate_costmap(
+        const grid_map::GridMap &submap,
+        const geometry_msgs::msg::TransformStamped &tf_odom_to_robot)
+    {
+        auto costmap = std::make_unique<nav_msgs::msg::OccupancyGrid>();
+
+        // Header: costmap is in robot frame
+        costmap->header.stamp = tf_odom_to_robot.header.stamp;
+        costmap->header.frame_id = robot_frame_;
+
+        // Grid metadata
+        costmap->info.resolution = costmap_resolution_;
+        costmap->info.width = costmap_cells_;
+        costmap->info.height = costmap_cells_;
+
+        // Origin: bottom-left corner of the costmap in robot frame
+        // Robot is at center of costmap, so origin is at (-size/2, -size/2)
+        costmap->info.origin.position.x = -costmap_size_ / 2.0;
+        costmap->info.origin.position.y = -costmap_size_ / 2.0;
+        costmap->info.origin.position.z = 0.0;
+        costmap->info.origin.orientation.w = 1.0;
+
+        costmap->data.resize(costmap_cells_ * costmap_cells_, -1);  // -1 = unknown
+
+        // Build terrain accumulation grid for fallback on unknown cells
+        std::vector<TerrainCellStats> terrain_grid;
+        if (enable_terrain_accum_ && terrain_cloud_ && !terrain_cloud_->empty()) {
+            terrain_grid = build_terrain_grid(tf_odom_to_robot);
+        }
+
+        // Get submap layers (check existence)
+        const bool has_ground = submap.exists("ground");
+        const bool has_points = submap.exists("points");
+        const bool has_variance = submap.exists("variance");
+        const bool has_confidence = submap.exists("groundpatch");
+
+        if (!has_ground) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                "GridMap missing 'ground' layer — cannot compute slope");
+        }
+
+        // Get robot position for coordinate mapping
+        const grid_map::Position submap_center = submap.getPosition();
+        const float submap_res = submap.getResolution();
+
+        // Iterate over costmap cells
+        for (int cy = 0; cy < costmap_cells_; ++cy) {
+            for (int cx = 0; cx < costmap_cells_; ++cx) {
+                // Costmap cell center in robot frame
+                const double rx = costmap->info.origin.position.x
+                                + (cx + 0.5) * costmap_resolution_;
+                const double ry = costmap->info.origin.position.y
+                                + (cy + 0.5) * costmap_resolution_;
+
+                // Transform to odom frame for GridMap lookup
+                const double ox = rx * cos_yaw_ - ry * sin_yaw_
+                                + tf_odom_to_robot.transform.translation.x;
+                const double oy = rx * sin_yaw_ + ry * cos_yaw_
+                                + tf_odom_to_robot.transform.translation.y;
+
+                grid_map::Position query_pos(ox, oy);
+                if (!submap.isInside(query_pos))
+                    continue;
+
+                // === Compute individual cost factors ===
+                double obstacle_cost = 0.0;
+                double slope_cost = 0.0;
+                double roughness_cost = 0.0;
+                double unknown_cost = 0.0;
+
+                grid_map::Index idx;
+                submap.getIndex(query_pos, idx);
+
+                // (a) Obstacle density
+                if (has_points) {
+                    float pt_count = submap.at("points", idx);
+                    obstacle_cost = std::min(
+                        static_cast<double>(pt_count) / obstacle_count_max_, 1.0);
+                }
+
+                // (b) Slope from elevation gradient
+                if (has_ground) {
+                    slope_cost = compute_slope(submap, idx);
+                }
+
+                // (c) Surface roughness
+                if (has_variance) {
+                    float var = submap.at("variance", idx);
+                    roughness_cost = std::min(
+                        static_cast<double>(var) / roughness_max_, 1.0);
+                }
+
+                // (d) Confidence / unknown penalty
+                if (has_confidence) {
+                    float conf = submap.at("groundpatch", idx);
+                    if (conf < confidence_threshold_) {
+                        unknown_cost = 1.0;  // Unknown area → high cost
+                    } else {
+                        unknown_cost = 0.0;
+                    }
+                }
+
+                // === Weighted combination ===
+                double total = w_obstacle_ * obstacle_cost
+                             + w_slope_ * slope_cost
+                             + w_roughness_ * roughness_cost
+                             + w_unknown_ * unknown_cost;
+
+                total = std::clamp(total, 0.0, 1.0);
+
+                // Map to OccupancyGrid [0, 100]
+                int8_t cell_value;
+                if (obstacle_cost >= 0.99) {
+                    cell_value = 100;  // Definite obstacle → lethal
+                } else if (total >= lethal_threshold_) {
+                    cell_value = 100;  // Above lethal threshold
+                } else {
+                    cell_value = static_cast<int8_t>(total * 99.0);
+                }
+
+                costmap->data[cy * costmap_cells_ + cx] = cell_value;
+            }
+        }
+
+        // === Fallback: fill unknown cells from accumulated terrain ===
+        if (enable_terrain_accum_ && !terrain_grid.empty()) {
+            int filled = 0;
+            for (int cy = 0; cy < costmap_cells_; ++cy) {
+                for (int cx = 0; cx < costmap_cells_; ++cx) {
+                    const int idx = cy * costmap_cells_ + cx;
+                    if (costmap->data[idx] != -1)
+                        continue;  // Already has data from GroundGrid
+
+                    const auto &tcell = terrain_grid[idx];
+                    if (tcell.count < 2)
+                        continue;  // Not enough accumulated points
+
+                    // Accumulated terrain contains ground-only points
+                    // → obstacle_cost = 0, unknown_cost = 0
+                    double roughness_cost = std::min(
+                        tcell.variance() / roughness_max_, 1.0);
+                    double slope_cost = compute_terrain_slope(
+                        terrain_grid, cx, cy);
+
+                    double total = w_slope_ * slope_cost
+                                 + w_roughness_ * roughness_cost;
+
+                    total = std::clamp(total, 0.0, 1.0);
+
+                    if (total >= lethal_threshold_) {
+                        costmap->data[idx] = 100;
+                    } else {
+                        costmap->data[idx] = static_cast<int8_t>(total * 99.0);
+                    }
+                    ++filled;
+                }
+            }
+
+            if (filled > 0) {
+                RCLCPP_DEBUG(get_logger(),
+                    "Terrain fallback filled %d unknown cells", filled);
+            }
+        }
+
+        return costmap;
+    }
+
+    // =========================================================================
+    // Slope computation from elevation layer
+    // =========================================================================
+    double compute_slope(const grid_map::GridMap &map, const grid_map::Index &idx) const
+    {
+        const auto &size = map.getSize();
+        const int i = idx(0);
+        const int j = idx(1);
+
+        // Need at least 1 neighbor on each side
+        if (i < 1 || j < 1 || i >= size(0) - 1 || j >= size(1) - 1)
+            return 0.0;
+
+        const float res = map.getResolution();
+        const auto &ground = map["ground"];
+
+        // Central difference for gradient
+        const float dz_dx = (ground(i + 1, j) - ground(i - 1, j)) / (2.0f * res);
+        const float dz_dy = (ground(i, j + 1) - ground(i, j - 1)) / (2.0f * res);
+        const float slope_rad = std::atan(std::sqrt(dz_dx * dz_dx + dz_dy * dz_dy));
+
+        // Normalize to [0, 1] based on max slope
+        return std::min(static_cast<double>(slope_rad) / slope_max_rad_, 1.0);
+    }
+
+    // =========================================================================
+    // Terrain grid from accumulated points (for unknown-cell fallback)
+    // =========================================================================
+
+    // Build a costmap-sized grid by binning terrain_cloud_ (odom frame)
+    // into robot-frame costmap cells.
+    std::vector<TerrainCellStats> build_terrain_grid(
+        const geometry_msgs::msg::TransformStamped &tf_odom_to_robot)
+    {
+        std::vector<TerrainCellStats> grid(costmap_cells_ * costmap_cells_);
+
+        std::lock_guard<std::mutex> lock(terrain_mutex_);
+        if (!terrain_cloud_ || terrain_cloud_->empty())
+            return grid;
+
+        // tf_odom_to_robot = lookupTransform(odom, robot)
+        // This gives robot position/orientation in odom frame.
+        // To convert odom→robot: p_robot = R^T * (p_odom - t)
+        const double tx = tf_odom_to_robot.transform.translation.x;
+        const double ty = tf_odom_to_robot.transform.translation.y;
+        const double half = costmap_size_ / 2.0;
+
+        for (const auto &pt : terrain_cloud_->points) {
+            // Odom → robot frame (2D rotation using cached yaw)
+            const double dx = pt.x - tx;
+            const double dy = pt.y - ty;
+            const double rx =  cos_yaw_ * dx + sin_yaw_ * dy;
+            const double ry = -sin_yaw_ * dx + cos_yaw_ * dy;
+
+            // Check if within costmap bounds
+            if (rx < -half || rx >= half || ry < -half || ry >= half)
+                continue;
+
+            // Convert to grid cell index
+            const int cx = static_cast<int>((rx + half) / costmap_resolution_);
+            const int cy = static_cast<int>((ry + half) / costmap_resolution_);
+
+            if (cx < 0 || cx >= costmap_cells_ || cy < 0 || cy >= costmap_cells_)
+                continue;
+
+            auto &cell = grid[cy * costmap_cells_ + cx];
+            cell.count++;
+            cell.sum_z += pt.z;
+            cell.sum_z2 += pt.z * pt.z;
+        }
+
+        return grid;
+    }
+
+    // Compute slope from terrain grid mean elevations using central difference
+    double compute_terrain_slope(
+        const std::vector<TerrainCellStats> &tgrid, int cx, int cy) const
+    {
+        if (cx < 1 || cy < 1 || cx >= costmap_cells_ - 1 || cy >= costmap_cells_ - 1)
+            return 0.0;
+
+        const auto &left  = tgrid[cy * costmap_cells_ + (cx - 1)];
+        const auto &right = tgrid[cy * costmap_cells_ + (cx + 1)];
+        const auto &down  = tgrid[(cy - 1) * costmap_cells_ + cx];
+        const auto &up    = tgrid[(cy + 1) * costmap_cells_ + cx];
+
+        // Need neighbors to have data for gradient computation
+        if (left.count == 0 || right.count == 0 ||
+            down.count == 0 || up.count == 0)
+            return 0.0;
+
+        const double dz_dx = (right.mean_z() - left.mean_z())
+                            / (2.0 * costmap_resolution_);
+        const double dz_dy = (up.mean_z() - down.mean_z())
+                            / (2.0 * costmap_resolution_);
+        const double slope_rad = std::atan(
+            std::sqrt(dz_dx * dz_dx + dz_dy * dz_dy));
+
+        return std::min(slope_rad / slope_max_rad_, 1.0);
+    }
+
+    // =========================================================================
+    // Filtered cloud callback — Persistent terrain accumulation
+    // =========================================================================
+    void filtered_cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
+    {
+        if (!enable_terrain_accum_)
+            return;
+
+        // Get TF: cloud frame → odom
+        geometry_msgs::msg::TransformStamped tf_to_odom;
+        try {
+            tf_to_odom = tf_buffer_->lookupTransform(
+                odom_frame_, msg->header.frame_id,
+                msg->header.stamp,
+                tf2::durationFromSec(0.1));
+        } catch (tf2::TransformException &ex) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                "Terrain accum TF failed: %s", ex.what());
+            return;
+        }
+
+        // Parse intensity to separate ground/obstacle
+        // GroundGrid visualize mode: ground=49, obstacle=99
+        const auto &fields = msg->fields;
+        int intensity_offset = -1;
+        for (const auto &f : fields) {
+            if (f.name == "intensity") {
+                intensity_offset = f.offset;
+                break;
+            }
+        }
+        if (intensity_offset < 0) return;
+
+        const float tx = tf_to_odom.transform.translation.x;
+        const float ty = tf_to_odom.transform.translation.y;
+        const float tz = tf_to_odom.transform.translation.z;
+
+        tf2::Quaternion q;
+        tf2::fromMsg(tf_to_odom.transform.rotation, q);
+        tf2::Matrix3x3 rot(q);
+
+        // Extract ground points and transform to odom frame
+        std::lock_guard<std::mutex> lock(terrain_mutex_);
+
+        const uint8_t *data = msg->data.data();
+        const size_t step = msg->point_step;
+        const int x_off = msg->fields[0].offset;
+        const int y_off = msg->fields[1].offset;
+        const int z_off = msg->fields[2].offset;
+
+        for (size_t i = 0; i < msg->width * msg->height; ++i) {
+            const float intensity = *reinterpret_cast<const float *>(
+                data + i * step + intensity_offset);
+
+            // Only accumulate ground points (intensity ≈ 49)
+            if (std::abs(intensity - 49.0f) > 5.0f)
+                continue;
+
+            const float px = *reinterpret_cast<const float *>(data + i * step + x_off);
+            const float py = *reinterpret_cast<const float *>(data + i * step + y_off);
+            const float pz = *reinterpret_cast<const float *>(data + i * step + z_off);
+
+            if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz))
+                continue;
+
+            // Transform to odom frame
+            tf2::Vector3 pt_in(px, py, pz);
+            tf2::Vector3 pt_odom = tf2::Vector3(
+                rot[0][0] * pt_in.x() + rot[0][1] * pt_in.y() + rot[0][2] * pt_in.z() + tx,
+                rot[1][0] * pt_in.x() + rot[1][1] * pt_in.y() + rot[1][2] * pt_in.z() + ty,
+                rot[2][0] * pt_in.x() + rot[2][1] * pt_in.y() + rot[2][2] * pt_in.z() + tz);
+
+            pcl::PointXYZI pt;
+            pt.x = pt_odom.x();
+            pt.y = pt_odom.y();
+            pt.z = pt_odom.z();
+            pt.intensity = 49.0f;  // ground label preserved
+            terrain_cloud_->points.push_back(pt);
+        }
+
+        // Sliding window: remove points outside radius from current robot position
+        prune_terrain_cloud(tx, ty);
+    }
+
+    // =========================================================================
+    // Terrain cloud management
+    // =========================================================================
+    void prune_terrain_cloud(float robot_x, float robot_y)
+    {
+        // Already locked by caller
+        const double r2 = terrain_radius_ * terrain_radius_;
+        auto &pts = terrain_cloud_->points;
+
+        // Remove points outside sliding window
+        pts.erase(
+            std::remove_if(pts.begin(), pts.end(),
+                [robot_x, robot_y, r2](const pcl::PointXYZI &p) {
+                    const double dx = p.x - robot_x;
+                    const double dy = p.y - robot_y;
+                    return (dx * dx + dy * dy) > r2;
+                }),
+            pts.end());
+
+        // If still over capacity, remove oldest (front of vector)
+        if (static_cast<int>(pts.size()) > terrain_max_points_) {
+            const int excess = pts.size() - terrain_max_points_;
+            pts.erase(pts.begin(), pts.begin() + excess);
+        }
+
+        terrain_cloud_->width = pts.size();
+        terrain_cloud_->height = 1;
+        terrain_cloud_->is_dense = true;
+    }
+
+    void publish_terrain_cloud()
+    {
+        if (!pub_terrain_ || pub_terrain_->get_subscription_count() == 0)
+            return;
+
+        std::lock_guard<std::mutex> lock(terrain_mutex_);
+        if (terrain_cloud_->empty())
+            return;
+
+        sensor_msgs::msg::PointCloud2 msg;
+        pcl::toROSMsg(*terrain_cloud_, msg);
+        msg.header.stamp = now();
+        msg.header.frame_id = odom_frame_;
+        pub_terrain_->publish(msg);
+    }
+
+    // =========================================================================
     // Member variables
-    // =====================================================================
+    // =========================================================================
 
     // TF
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
     // Subscribers
-    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_costmap_;
-    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_goal_;
+    rclcpp::Subscription<grid_map_msgs::msg::GridMap>::SharedPtr sub_gridmap_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_filtered_;
 
     // Publishers
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_global_path_;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_local_traj_;
+    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pub_costmap_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_terrain_;
+    rclcpp::TimerBase::SharedPtr terrain_timer_;
 
-    // Timer
-    rclcpp::TimerBase::SharedPtr control_timer_;
+    // Terrain accumulation
+    pcl::PointCloud<pcl::PointXYZI>::Ptr terrain_cloud_;
+    std::mutex terrain_mutex_;
 
-    // State
-    nav_msgs::msg::OccupancyGrid::ConstSharedPtr costmap_;
-    std::mutex costmap_mutex_;
-    geometry_msgs::msg::PoseStamped goal_;
-    bool goal_active_ = false;
-    double cur_v_ = 0.0;  // current velocity (for dynamic window)
-    double cur_w_ = 0.0;
+    // Cached yaw (updated each frame)
+    double cos_yaw_ = 1.0;
+    double sin_yaw_ = 0.0;
 
     // Parameters
-    double costmap_size_, costmap_resolution_;
-    int grid_cells_;
-    double max_lin_vel_, min_lin_vel_, max_ang_vel_;
-    double max_lin_acc_, max_ang_acc_;
-    int n_v_samples_, n_w_samples_;
-    double sim_time_, sim_granularity_;
-    double w_heading_, w_clearance_, w_velocity_, w_path_dist_;
-    double goal_xy_tol_, goal_yaw_tol_;
-    double astar_lethal_, astar_cost_weight_;
-    double robot_length_, robot_width_, clearance_margin_;
-    double control_rate_;
-    std::string odom_frame_, robot_frame_;
-    double slope_speed_factor_, slope_threshold_deg_;
+    double costmap_size_;
+    double costmap_resolution_;
+    int costmap_cells_;
+    std::string robot_frame_;
+    std::string odom_frame_;
+
+    double w_obstacle_;
+    double w_slope_;
+    double w_roughness_;
+    double w_unknown_;
+
+    double slope_max_rad_;
+    double roughness_max_;
+    double obstacle_count_max_;
+    double confidence_threshold_;
+    double lethal_threshold_;
+
+    bool enable_terrain_accum_;
+    int terrain_max_points_;
+    double terrain_radius_;
+
+    std::string gridmap_topic_;
+    std::string filtered_cloud_topic_;
+    std::string costmap_topic_;
+    std::string terrain_cloud_topic_;
 };
 
-// =========================================================================
-// Main
-// =========================================================================
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<PathPlannerNode>());
+    rclcpp::spin(std::make_shared<TerrainCostmapNode>());
     rclcpp::shutdown();
     return 0;
 }
