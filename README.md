@@ -27,6 +27,7 @@ Vision-Inertial-LiDAR autonomous mobile robot for outdoor mountain terrain navig
 | fast_lio | FAST-LIO2 with M300 support (LiDAR type 5), livox dependency removed | [hku-mars/FAST_LIO (ROS2)](https://github.com/hku-mars/FAST_LIO/tree/ROS2) | GPL-2.0 |
 | cloud_merger | Merges M300 + S10 Ultra point clouds in body frame | Original | BSD-3 |
 | groundgrid | Grid-based ground segmentation and elevation mapping | [dcmlr/groundgrid (ros2-jazzy)](https://github.com/dcmlr/groundgrid/tree/ros2-jazzy) | BSD-3 |
+| terrain_costmap | 3m×3m robot-centric traversability costmap from GroundGrid output | Original | BSD-3 |
 
 ### Robot Platform
 
@@ -74,6 +75,9 @@ ros2 launch cloud_merger cloud_merger.launch.py
 
 # 6. Ground segmentation
 ros2 launch groundgrid amr_groundgrid.launch.py
+
+# 7. Terrain costmap
+ros2 launch terrain_costmap terrain_costmap.launch.py
 ```
 
 ---
@@ -89,32 +93,6 @@ python3 test/test_pipeline.py
 # Terminal 4: Real-time Hz and latency monitor
 python3 test/test_monitor.py
 ```
-
-### Expected test_monitor.py Output
-
-```
-[  10.0s]
-  cloud_registered_body    |  10.0 Hz |     1.2 ms |  2772 pts
-  LxCamera_Cloud           |  10.0 Hz |     1.5 ms |  1634 pts
-  merged_cloud             |  10.0 Hz |     2.8 ms |  4406 pts
-  filtered_cloud           |  10.0 Hz |    15.3 ms |  1205 pts
-  Odometry                 |  10.0 Hz |     0.3 ms |        -
-```
-
----
-
-## Current Status
-
-- [x] Sensor drivers (M300 LiDAR, S10 Ultra camera)
-- [x] FAST-LIO2 localization
-- [x] Point cloud merger (M300 + S10 Ultra)
-- [x] GroundGrid ground segmentation
-- [x] TF tree and URDF integration
-- [x] Sensor-less test pipeline
-- [ ] Terrain-aware costmap generation
-- [ ] Nav2 path planning integration
-- [ ] Safety systems (rollover detection, emergency stop)
-- [ ] S10 Ultra extrinsic calibration (current values are estimates)
 
 ---
 

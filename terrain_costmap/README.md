@@ -1,110 +1,133 @@
-# VIL-Project-AMR
+# terrain_costmap
 
-Vision-Inertial-LiDAR autonomous mobile robot for outdoor mountain terrain navigation.
+A ROS2 package that generates a robot-centric traversability costmap from GroundGrid output. Designed for caterpillar (skid-steer) robots operating on mountain terrain.
 
-- Platform: OMOROBOT DONKEYBOTI (tracked, skid-steer)
-- LiDAR: Pacecat LDS-M300-E (3D, 200kHz, 360 x 70 deg FOV, built-in 6-axis IMU)
-- Camera: MRDVS S10 Ultra (dToF, 120 x 80 deg FOV, XYZRGB point cloud)
-- Computer: Dragonwing IQ-9075 (Qualcomm QCS8550, ARM64)
-- OS: Ubuntu 24.04, ROS2 Jazzy
-- Environment: Outdoor mountain terrain
+## Overview
 
----
+This node subscribes to GroundGrid's 120m×120m GridMap, crops a 3m×3m submap around the robot, and computes per-cell traversability cost from four factors:
 
-## Packages
+- **Obstacle density** — non-ground point count from the `points` layer
+- **Slope** — elevation gradient computed from the `ground` layer using central differences
+- **Roughness** — height variance from the `variance` layer
+- **Uncertainty** — low confidence in the `groundpatch` layer penalizes unobserved areas
 
-### Sensor Drivers
+The output is a standard `nav_msgs/OccupancyGrid` (values 0–100) in the robot frame, ready for path planners such as Nav2, A\*, or DWA.
 
-| Package | Description | Source | License |
-|---------|-------------|--------|---------|
-| pacecat_m300 | M300-E 3D LiDAR + IMU driver | [BlueSeaLidar/m300](https://github.com/BlueSeaLidar/m300) | MIT |
-| lx_camera_ros | S10 Ultra dToF camera driver | [Lanxin-MRDVS/CameraSDK](https://github.com/Lanxin-MRDVS/CameraSDK) | Proprietary (SDK) |
+### Persistent Terrain Accumulation
 
-### Perception
+An optional feature accumulates ground points (from GroundGrid's `filtered_cloud`) in the odom frame over time. This compensates for sensor blind spots — particularly the rear and sides of the robot where neither the M300 LiDAR nor the S10 Ultra camera has coverage. A sliding window (default 10m radius) manages memory.
 
-| Package | Description | Source | License |
-|---------|-------------|--------|---------|
-| fast_lio | FAST-LIO2 with M300 support (LiDAR type 5), livox dependency removed | [hku-mars/FAST_LIO (ROS2)](https://github.com/hku-mars/FAST_LIO/tree/ROS2) | GPL-2.0 |
-| cloud_merger | Merges M300 + S10 Ultra point clouds in body frame | Original | BSD-3 |
-| groundgrid | Grid-based ground segmentation and elevation mapping | [dcmlr/groundgrid (ros2-jazzy)](https://github.com/dcmlr/groundgrid/tree/ros2-jazzy) | BSD-3 |
-| terrain_costmap | 3m×3m robot-centric traversability costmap from GroundGrid output | Original | BSD-3 |
+## Topics
 
-### Robot Platform
+| Direction | Topic | Type | Description |
+|-----------|-------|------|-------------|
+| Subscribe | `/groundgrid/grid_map` | `grid_map_msgs/GridMap` | GroundGrid elevation map with layers |
+| Subscribe | `/groundgrid/filtered_cloud` | `sensor_msgs/PointCloud2` | Labeled cloud (ground=49, obstacle=99) |
+| Publish | `/terrain_costmap` | `nav_msgs/OccupancyGrid` | 3m×3m traversability costmap |
+| Publish | `/terrain_costmap/terrain_cloud` | `sensor_msgs/PointCloud2` | Accumulated terrain (debug/viz) |
 
-| Package | Description | Source | License |
-|---------|-------------|--------|---------|
-| omorobot | DONKEYBOTI tracked robot: URDF, motor control, bringup | [omorobot/omorobot_ros2](https://github.com/omorobot/omorobot_ros2) | Apache-2.0 |
+## TF Requirements
 
----
+The node requires the following TF chain to be available:
+
+`odom` → `camera_init` → `body` → `base_footprint` → `base_link`
+
+- `odom → camera_init`: static identity
+- `camera_init → body`: provided by FAST-LIO2 (dynamic)
+- `body → base_link`: static offset from URDF
+
+## Parameters
+
+All parameters are defined in `param/terrain_costmap.yaml`.
+
+### Costmap Geometry
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `costmap_size` | `3.0` | Side length of square costmap [m] |
+| `costmap_resolution` | `0.1` | Cell size [m] (3m / 0.1m = 30×30 = 900 cells) |
+| `robot_frame` | `base_link` | Robot body frame |
+| `odom_frame` | `odom` | Odometry frame |
+
+### Cost Weights
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `weight_obstacle` | `0.40` | Weight for obstacle density |
+| `weight_slope` | `0.30` | Weight for terrain inclination |
+| `weight_roughness` | `0.15` | Weight for surface irregularity |
+| `weight_unknown` | `0.15` | Weight for unobserved area penalty |
+
+### Thresholds
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `slope_max_deg` | `35.0` | Slopes ≥ this angle → cost 1.0 (caterpillar tolerance) |
+| `roughness_max` | `0.05` | Variance ≥ this → cost 1.0 [m²] |
+| `obstacle_count_max` | `5.0` | Obstacle points ≥ this → cost 1.0 |
+| `confidence_threshold` | `0.1` | Groundpatch confidence below this → unknown |
+| `lethal_threshold` | `0.8` | Total cost ≥ this → cell set to 100 (impassable) |
+
+### Terrain Accumulation
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `enable_terrain_accumulation` | `true` | Enable ground point accumulation |
+| `terrain_max_points` | `200000` | Max accumulated points in memory |
+| `terrain_radius` | `10.0` | Sliding window radius around robot [m] |
+| `terrain_publish_rate` | `1.0` | Terrain cloud publish rate for debug [Hz] |
 
 ## Build
 
-```bash
-mkdir -p ~/amr_ws/src
-cd ~/amr_ws/src
-git clone https://github.com/Hyeokk/VIL-Project-AMR.git .
+Place the `terrain_costmap` directory inside the `VIL-Project-AMR` repository at the top level, alongside `cloud_merger`, `groundgrid`, etc.
 
-cd ~/amr_ws
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install
+```bash
+cd ~/colcon_ws
+colcon build --packages-select terrain_costmap
 source install/setup.bash
 ```
 
----
+### Dependencies
 
-## Launch Sequence
+- `grid_map_ros`, `grid_map_msgs`, `grid_map_core`
+- `tf2_ros`, `tf2`, `tf2_geometry_msgs`
+- `pcl_conversions`, PCL (common, io, filters)
+- `nav_msgs`, `sensor_msgs`, `geometry_msgs`
 
-Each node group runs in a separate terminal.
+## Launch
 
 ```bash
-# 1. Robot platform (motor + URDF TF)
-export ROBOT_MODEL=DONKEYBOTI
-ros2 launch omorobot_bringup bringup_launch.py publish_tf:=false
-
-# 2. M300 LiDAR driver
-ros2 launch pacecat_m300_driver LDS-M300-E.launch.py
-
-# 3. FAST-LIO2 + static TF bridges
-ros2 launch fast_lio mapping.launch.py
-
-# 4. S10 Ultra camera driver
-ros2 launch lx_camera_ros lx_camera_ros.launch.py
-
-# 5. Point cloud merger
-ros2 launch cloud_merger cloud_merger.launch.py
-
-# 6. Ground segmentation
-ros2 launch groundgrid amr_groundgrid.launch.py
-
-# 7. Terrain costmap
+# Default (3m×3m, 0.1m resolution)
 ros2 launch terrain_costmap terrain_costmap.launch.py
+
+# Custom size
+ros2 launch terrain_costmap terrain_costmap.launch.py costmap_size:=5.0 costmap_resolution:=0.2
 ```
 
----
+## Cost Calculation
 
-## Testing Without Sensors
+Each costmap cell value is computed as:
 
-```bash
-# Terminal 1: Simulated sensor data + TF
-python3 test/test_pipeline.py
+```
+total = w_obstacle × obstacle_cost
+      + w_slope    × slope_cost
+      + w_roughness× roughness_cost
+      + w_unknown  × unknown_cost
 
-# Terminal 2-3: cloud_merger and GroundGrid (same as above)
-
-# Terminal 4: Real-time Hz and latency monitor
-python3 test/test_monitor.py
+cell_value = total × 99       (if total < lethal_threshold)
+cell_value = 100               (if total ≥ lethal_threshold or definite obstacle)
+cell_value = -1                (if cell has no data)
 ```
 
----
+Where each individual cost is normalized to [0.0, 1.0]:
 
-## Docs
+- `obstacle_cost` = min(point_count / obstacle_count_max, 1.0)
+- `slope_cost` = min(atan(gradient_magnitude) / slope_max_rad, 1.0)
+- `roughness_cost` = min(variance / roughness_max, 1.0)
+- `unknown_cost` = 1.0 if confidence < threshold, else 0.0
 
-| Document | Description |
-|----------|-------------|
-| [docs/Network.md](docs/Network.md) | IQ-9075 network setup: WiFi + LiDAR + Camera routing |
-| [docs/Monitoring.md](docs/Monitoring.md) | Remote rviz2 visualization via Docker (Jazzy + CycloneDDS) |
+## Notes
 
----
-
-## License
-
-Each package retains its original license. See individual package directories.
+- GroundGrid runs its full 120m×120m GridMap computation regardless of this node's crop size. The crop only reduces downstream cost calculation and path planner search space.
+- The `visualize` parameter in GroundGrid's launch must be set to `true` for terrain accumulation to work, since ground points are identified by their intensity label (49).
+- The terrain accumulation cloud is separate from FAST-LIO2's ikd-Tree map. It must never be fed back into FAST-LIO2.
