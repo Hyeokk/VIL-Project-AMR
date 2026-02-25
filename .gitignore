@@ -16,3 +16,7 @@ __pycache__/
 *.swp
 *~
 .vscode/
+
+# FAST LIO2
+fast_lio/Log/
+fast_lio/PCD/
