@@ -1,0 +1,59 @@
+# path_planner parameters for DONKEYBOTI caterpillar robot
+# A* global planner + DWA local planner
+#
+# Costmap: 5m x 5m, 0.1m resolution = 50x50 cells
+# Robot: differential-drive (skid-steer), turn-in-place capable
+
+path_planner_node:
+  ros__parameters:
+    # --- Costmap (must match terrain_costmap) ---
+    costmap_size: 5.0           # [m] side length
+    costmap_resolution: 0.1     # [m] cell size → 50x50
+
+    # --- Robot kinematics (DONKEYBOTI.yaml) ---
+    max_lin_vel: 0.6            # [m/s] max forward velocity
+    min_lin_vel: -0.2           # [m/s] max reverse (limited for safety)
+    max_ang_vel: 0.5            # [rad/s] max turn rate
+    max_lin_acc: 1.0            # [m/s²] linear acceleration limit
+    max_ang_acc: 2.0            # [rad/s²] angular acceleration limit
+
+    # --- DWA sampling ---
+    n_v_samples: 11             # linear velocity samples
+    n_w_samples: 21             # angular velocity samples (more for turn-in-place)
+    sim_time: 1.5               # [s] forward simulation horizon
+    sim_granularity: 0.1        # [s] simulation time step
+
+    # --- DWA scoring weights ---
+    weight_heading: 1.0         # alignment to A* path direction
+    weight_clearance: 0.5       # terrain cost / obstacle distance
+    weight_velocity: 0.3        # prefer forward motion
+    weight_path_dist: 0.8       # closeness to A* global path
+
+    # --- Goal tolerance ---
+    goal_xy_tolerance: 0.2      # [m] position tolerance
+    goal_yaw_tolerance: 0.15    # [rad] ~8.6° heading tolerance
+
+    # --- A* configuration ---
+    astar_lethal_cost: 80.0     # cells >= this value are impassable
+    astar_cost_weight: 2.0      # terrain cost penalty multiplier
+
+    # --- Robot footprint (rectangular, DONKEYBOTI actual size) ---
+    robot_length: 1.432         # [m] front-to-back (x-axis)
+    robot_width: 0.850          # [m] left-to-right (y-axis)
+    clearance_margin: 0.1       # [m] extra safety buffer around footprint
+
+    # --- Control ---
+    control_rate: 10.0          # [Hz] control loop frequency
+
+    # --- Frames ---
+    odom_frame: "odom"
+    robot_frame: "base_link"
+
+    # --- Topics ---
+    costmap_topic: "/terrain_costmap"
+    goal_topic: "/goal_pose"
+    cmd_vel_topic: "/cmd_vel"
+
+    # --- Slope speed reduction (future: IMU integration) ---
+    slope_speed_factor: 0.5     # reduce max_v by this factor on slopes
+    slope_threshold_deg: 15.0   # [deg] slope angle to trigger speed reduction
