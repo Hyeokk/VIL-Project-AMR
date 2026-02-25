@@ -197,7 +197,7 @@ private:
         try {
             tf_odom_to_robot = tf_buffer_->lookupTransform(
                 odom_frame_, robot_frame_,
-                msg->info.header.stamp,
+                msg->header.stamp,
                 tf2::durationFromSec(0.1));
         } catch (tf2::TransformException &ex) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
