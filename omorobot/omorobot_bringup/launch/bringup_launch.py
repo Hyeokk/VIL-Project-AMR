@@ -36,7 +36,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('robot_yaml', default_value=robot_yaml),
-        DeclareLaunchArgument('publish_tf', default_value='true',
+        DeclareLaunchArgument('publish_tf', default_value='false',
             description='Publish odom->base_footprint TF from wheel odometry. '
                         'Set false when using FAST-LIO2 for localization.'),
 
