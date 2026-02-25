@@ -34,7 +34,7 @@ def generate_launch_description():
             arguments=['0', '0', '0', '0', '0', '0', 'odom', 'camera_init'],
         ),
 
-        # body → base_footprint (URDF chain inverse)
+        # body → base_footprint
         #   base_footprint → m300_imu_link(=body) = (0.3544, -0.0287, 0.5848)
         #   inverse: (-0.3544, 0.0287, -0.5848)
         Node(

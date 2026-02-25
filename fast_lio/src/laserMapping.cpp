@@ -40,14 +40,14 @@
 #include <csignal>
 #include <chrono>
 #include <unistd.h>
-#include <Python.h>
+// #include <Python.h>  // [OPT] 미사용 — matplotlib 디버그용, 빌드 의존성 제거
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
-#include <visualization_msgs/msg/marker.hpp>
+// #include <visualization_msgs/msg/marker.hpp>  // [OPT] 미사용
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -59,7 +59,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
-// livox_ros_driver2 removed — M300 uses standard PointCloud2
+// livox_ros_driver2 removed — M300 uses PointCloud2
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -306,8 +306,10 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     sig_buffer.notify_all();
 }
 
+// livox_pcl_cbk removed — M300 uses standard PointCloud2 (standard_pcl_cbk)
 double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
+
 
 void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 {
@@ -448,7 +450,8 @@ void map_incremental()
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
+// void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull, rclcpp::Time timestamp)  // [OPT] 팀원 변경 — this->now() 사용
+void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)  // [OPT] 원본 복원 — get_ros_time(lidar_end_time) 사용 (TF 시간 정합성)
 {
     if(scan_pub_en)
     {
@@ -466,7 +469,8 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
         sensor_msgs::msg::PointCloud2 laserCloudmsg;
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
         // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-        laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+        // laserCloudmsg.header.stamp = timestamp;  // [OPT] 팀원 변경 — this->now()가 전달됨
+        laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);  // [OPT] 원본 복원
         laserCloudmsg.header.frame_id = "camera_init";
         pubLaserCloudFull->publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
@@ -475,7 +479,6 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. noted that pcd save will influence the real-time performences **/
-    /*
     if (pcd_save_en)
     {
         int size = feats_undistort->points.size();
@@ -502,10 +505,10 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
             scan_wait_num = 0;
         }
     }
-    */
 }
 
-void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
+// void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body, rclcpp::Time timestamp)  // [OPT] 팀원 변경
+void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)  // [OPT] 원본 복원
 {
     int size = feats_undistort->points.size();
     PointCloudXYZI::Ptr laserCloudIMUBody(new PointCloudXYZI(size, 1));
@@ -518,55 +521,16 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
 
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
+    // laserCloudmsg.header.stamp = timestamp;  // [OPT] 팀원 변경
+    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);  // [OPT] 원본 복원
     laserCloudmsg.header.frame_id = "body";
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
 
-void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect)
-{
-    PointCloudXYZI::Ptr laserCloudWorld( \
-                    new PointCloudXYZI(effct_feat_num, 1));
-    for (int i = 0; i < effct_feat_num; i++)
-    {
-        RGBpointBodyToWorld(&laserCloudOri->points[i], \
-                            &laserCloudWorld->points[i]);
-    }
-    sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
-    pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
-    laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = "camera_init";
-    pubLaserCloudEffect->publish(laserCloudFullRes3);
-}
 
-void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
-{
-    PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
-    int size = laserCloudFullRes->points.size();
-    PointCloudXYZI::Ptr laserCloudWorld( \
-                    new PointCloudXYZI(size, 1));
 
-    for (int i = 0; i < size; i++)
-    {
-        RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
-                            &laserCloudWorld->points[i]);
-    }
-    *pcl_wait_pub += *laserCloudWorld;
 
-    sensor_msgs::msg::PointCloud2 laserCloudmsg;
-    pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
-    laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
-    pubLaserCloudMap->publish(laserCloudmsg);
-
-    // sensor_msgs::msg::PointCloud2 laserCloudMap;
-    // pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "camera_init";
-    // pubLaserCloudMap->publish(laserCloudMap);
-}
 
 void save_to_pcd()
 {
@@ -587,11 +551,13 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+// void publish_odometry(..., rclcpp::Time timestamp)  // [OPT] 팀원 변경
+void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)  // [OPT] 원본 복원
 {
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
-    odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
+    // odomAftMapped.header.stamp = timestamp;  // [OPT] 팀원 변경
+    odomAftMapped.header.stamp = get_ros_time(lidar_end_time);  // [OPT] 원본 복원
     set_posestamp(odomAftMapped.pose);
     pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
@@ -608,8 +574,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
+    trans.header.stamp = odomAftMapped.header.stamp;
     trans.child_frame_id = "body";
-    trans.header.stamp = get_ros_time(lidar_end_time);
     trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
     trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
     trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
@@ -620,10 +586,12 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     tf_br->sendTransform(trans);
 }
 
-void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
+// void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath, rclcpp::Time timestamp)  // [OPT] 팀원 변경
+void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)  // [OPT] 원본 복원
 {
     set_posestamp(msg_body_pose);
-    msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
+    // msg_body_pose.header.stamp = timestamp;  // [OPT] 팀원 변경
+    msg_body_pose.header.stamp = get_ros_time(lidar_end_time);  // [OPT] 원본 복원
     msg_body_pose.header.frame_id = "camera_init";
 
     /*** if path is too large, the rvis will crash ***/
@@ -761,8 +729,8 @@ public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
     {
         this->declare_parameter<bool>("publish.path_en", true);
-        this->declare_parameter<bool>("publish.effect_map_en", false);
-        this->declare_parameter<bool>("publish.map_en", false);
+
+
         this->declare_parameter<bool>("publish.scan_publish_en", true);
         this->declare_parameter<bool>("publish.dense_publish_en", true);
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
@@ -783,12 +751,13 @@ public:
         this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
         this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
         this->declare_parameter<double>("preprocess.blind", 0.01);
-        this->declare_parameter<int>("preprocess.lidar_type", AVIA);
+        // this->declare_parameter<int>("preprocess.lidar_type", M300);  // [OPT] 팀원 변경
+        this->declare_parameter<int>("preprocess.lidar_type", PACECAT);  // [OPT] 원본 복원
         this->declare_parameter<int>("preprocess.scan_line", 16);
         this->declare_parameter<int>("preprocess.timestamp_unit", US);
         this->declare_parameter<int>("preprocess.scan_rate", 10);
         this->declare_parameter<int>("point_filter_num", 2);
-        this->declare_parameter<bool>("feature_extract_enable", false);
+
         this->declare_parameter<bool>("runtime_pos_log_enable", false);
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
         this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
@@ -797,8 +766,8 @@ public:
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
-        this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
-        this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
+
+
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
         this->get_parameter_or<bool>("publish.dense_publish_en", dense_pub_en, true);
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
@@ -819,12 +788,13 @@ public:
         this->get_parameter_or<double>("mapping.b_gyr_cov",b_gyr_cov,0.0001);
         this->get_parameter_or<double>("mapping.b_acc_cov",b_acc_cov,0.0001);
         this->get_parameter_or<double>("preprocess.blind", p_pre->blind, 0.01);
-        this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, AVIA);
+        // this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, M300);  // [OPT] 팀원 변경
+        this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, PACECAT);  // [OPT] 원본 복원
         this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
         this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
         this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
         this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
-        this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
+
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
         this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
@@ -879,13 +849,14 @@ public:
         else
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
-        /*** ROS subscribe initialization ***/
+        /*** ROS subscribe initialization — PointCloud2 only (Livox removed) ***/
         sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
-        pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
-        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
+
+
+
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -894,8 +865,7 @@ public:
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
         timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
 
-        auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
-        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
+
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
@@ -1016,7 +986,8 @@ private:
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            // publish_odometry(pubOdomAftMapped_, tf_broadcaster_, this->now());  // [OPT] 팀원 변경 — this->now() TF 시간 불일치 위험
+            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);  // [OPT] 원본 복원 — get_ros_time(lidar_end_time) 사용
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1024,11 +995,18 @@ private:
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
+            // [OPT] 팀원 원본:
+            // if (path_en)                         publish_path(pubPath_, this->now());
+            // if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_, this->now());
+            // if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_, this->now());
+            // [OPT] 변경: this->now() 제거 + scan_body_pub_en 커플링 해제
             if (path_en)                         publish_path(pubPath_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
-            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
-            if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
-            // if (map_pub_en) publish_map(pubLaserCloudMap_);
+            // if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);  // [OPT] 원본 — scan_pub_en에 종속
+            if (scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);  // [OPT] 변경 — scan_pub_en과 독립적으로 body frame publish
+
+
+
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1062,10 +1040,7 @@ private:
         }
     }
 
-    void map_publish_callback()
-    {
-        if (map_pub_en) publish_map(pubLaserCloudMap_);
-    }
+
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
@@ -1086,19 +1061,20 @@ private:
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
+
+
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
+    // sub_pcl_livox_ removed — Livox not used
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::TimerBase::SharedPtr map_pub_timer_;
+
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
-    bool effect_pub_en = false, map_pub_en = false;
+
     int effect_feat_num = 0, frame_num = 0;
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
     bool flg_EKF_converged, EKF_stop_flg = 0;

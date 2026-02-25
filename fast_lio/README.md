@@ -1,86 +1,54 @@
-# FAST-LIO2 (Pacecat M300 Fork)
+# Fast Lio VIL (Elevation Mapping & Navigation)
 
-FAST-LIO2 modified for Pacecat LDS-M300-E LiDAR on ROS2 Jazzy.
+This package integrates Fast-LIO2 with an elevation mapping node to generate 2.5D maps for navigation. It accumulates historical map data to create a persistent "trace" of the robot's path.
 
-> Source: [hku-mars/FAST_LIO (ROS2 branch)](https://github.com/hku-mars/FAST_LIO/tree/ROS2)
+## Dependencies
 
----
+- ROS 2 Humble (or compatible)
+- PCL (Point Cloud Library)
+- Eigen3
+- **Livox ROS Driver 2**: Included in `src/` (ensure it is built).
 
-## Modifications from Original
+## Build Instructions
 
-**No algorithm logic was modified.** Changes are for M300 compatibility and livox dependency removal.
+1.  **Clone the repository**:
+    ```bash
+    mkdir -p dev_ws/src
+    cd dev_ws/src
+    git clone <your-repo-url>
+    ```
 
-| Change | Detail |
-|--------|--------|
-| Added `PACECAT` LiDAR type (5) | `preprocess.h/cpp` — M300 point cloud handler |
-| Added `m300_ros::Point` | PCL type matching M300 PointCloud2 field layout |
-| Removed `livox_ros_driver2` dependency | No longer needed — all inputs via standard PointCloud2 |
-| Added `config/m300.yaml` | M300-specific config (topics, IMU extrinsics, scan params) |
+2.  **Install dependencies**:
+    ```bash
+    cd ~/dev_ws
+    rosdep install --from-paths src --ignore-src -r -y
+    ```
 
----
+3.  **Build**:
+    ```bash
+    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+    ```
 
-## M300 Point Cloud Format
+4.  **Source**:
+    ```bash
+    source install/setup.bash
+    ```
 
-The M300 driver publishes `sensor_msgs/PointCloud2` with fields:
+## Usage
 
-| Field | Type | Offset | Unit |
-|-------|------|--------|------|
-| x, y, z | float32 | 0, 4, 8 | meters |
-| intensity | float32 | 12 | - |
-| tag | uint8 | 16 | - |
-| line | uint8 | 17 | - |
-| timestamp | float64 | 18 | nanoseconds (offset from first point) |
-
-`m300_handler()` converts `timestamp` (ns) → `curvature` (ms) for FAST-LIO2 motion undistortion.
-
----
-
-## Build
-
+### 1. Launch Robot & Mapping
 ```bash
-cd ~/amr_ws
-source /opt/ros/jazzy/setup.bash
-colcon build --symlink-install --packages-select fast_lio
+ros2 launch lio_nav_bringup bringup.launch.py
 ```
 
-## Run
-
+### 2. Run with Bag File (Simulation)
 ```bash
-source ~/amr_ws/install/setup.bash
-ros2 launch fast_lio mapping.launch.py
+ros2 bag play path/to/your/bag --clock
 ```
 
-Override config:
-```bash
-ros2 launch fast_lio mapping.launch.py config_file:=m300.yaml rviz:=false
-```
+## Parameters
 
----
-
-## Config (config/m300.yaml)
-
-| Parameter | Value | Note |
-|-----------|-------|------|
-| `lid_topic` | `/m300/pointcloud` | M300 driver PointCloud2 topic |
-| `imu_topic` | `/m300/imu` | M300 driver IMU topic |
-| `lidar_type` | 5 | PACECAT enum |
-| `timestamp_unit` | 3 | NS (nanoseconds) |
-| `scan_line` | 1 | Non-repetitive (no fixed scan lines) |
-| `scan_rate` | 10 | 10 Hz |
-| `blind` | 0.5 | Min range (m) |
-| `fov_degree` | 360 | Full horizontal FOV |
-| `det_range` | 50 | Max range (m) |
-| `extrinsic_T` | [0.0194, -0.0287, -0.0452] | IMU→LiDAR offset from M300 manual |
-| `extrinsic_est_en` | true | Online extrinsic estimation |
-
----
-
-## Published Topics
-
-| Topic | Type | Description |
-|-------|------|-------------|
-| `/cloud_registered` | `PointCloud2` | Registered cloud (world frame) |
-| `/cloud_registered_body` | `PointCloud2` | Registered cloud (body frame) |
-| `/Odometry` | `Odometry` | 6-DOF pose |
-| `/path` | `Path` | Trajectory |
-| `/Laser_map` | `PointCloud2` | Accumulated map |
+Key parameters in `launch/elevation_mapping.launch.py`:
+- `obstacle_height_thresh`: **0.3** (Default). Height difference to consider as an obstacle.
+- `grid_resolution`: **0.2**. Size of each grid cell (meters).
+- `local_map_size`: **30.0**. Size of the sliding window for active mapping.

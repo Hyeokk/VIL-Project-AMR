@@ -1,12 +1,16 @@
 /**:
     ros__parameters:
         # FAST-LIO2 config for Pacecat LDS-M300-E on DONKEYBOTI
-        # Reference: donkibot_autonomous/src/fast_lio/config/m300_donki.yaml
-        point_filter_num: 3
-        max_iteration: 3
-        filter_size_surf: 0.5
-        filter_size_map: 0.5
-        cube_side_length: 1000.0
+        # [OPT] point_filter_num: 3        # 원본
+        point_filter_num: 2                 # [OPT] 변경 — 포인트 50% 더 사용, 급격한 움직임 시 매칭 안정성
+        # [OPT] max_iteration: 3            # 원본
+        max_iteration: 4                    # [OPT] 변경 — IEKF 수렴 여유 확보
+        # [OPT] filter_size_surf: 0.5       # 원본
+        filter_size_surf: 0.3               # [OPT] 변경 — 더 세밀한 scan-to-map 매칭
+        # [OPT] filter_size_map: 0.5        # 원본
+        filter_size_map: 0.3                # [OPT] 변경 — 맵 해상도 향상, 동적 물체 포인트 빠른 갱신
+        # [OPT] cube_side_length: 1000.0    # 원본
+        cube_side_length: 500.0             # [OPT] 변경 — 오래된 맵 포인트 더 빨리 제거
         runtime_pos_log_enable: false
 
         common:
@@ -23,12 +27,15 @@
             blind: 0.5
 
         mapping:
-            acc_cov: 0.1
-            gyr_cov: 0.1
+            # [OPT] acc_cov: 0.1         # 원본 — IMU 불신
+            acc_cov: 0.01                 # [OPT] 변경 — IMU 더 신뢰, 급격한 움직임 시 LiDAR 블러 보완
+            # [OPT] gyr_cov: 0.1         # 원본 — IMU 불신
+            gyr_cov: 0.01                 # [OPT] 변경 — IMU 더 신뢰
             b_acc_cov: 0.0001
             b_gyr_cov: 0.0001
             fov_degree: 360.0
-            det_range: 50.0
+            # [OPT] det_range: 50.0      # 원본
+            det_range: 30.0               # [OPT] 변경 — 먼 거리 노이즈 포인트 제거
             extrinsic_est_en: false
             # LiDAR→IMU extrinsic (M300 manual §5.5: 19.4, -28.7, -45.2 mm)
             extrinsic_T: [ 0.0194, -0.0287, -0.0452 ]
@@ -37,10 +44,13 @@
                            0., 0., 1.]
 
         publish:
-            path_en: true
-            scan_publish_en: true
-            dense_publish_en: true
-            scan_bodyframe_pub_en: true
+            # path_en: true              # [OPT] 원본
+            path_en: false               # [OPT] 변경 — 메모리 절약
+            # scan_publish_en: true      # [OPT] 원본
+            scan_publish_en: false       # [OPT] 변경 — CPU 절약
+            # dense_publish_en: true     # [OPT] 원본
+            dense_publish_en: false      # [OPT] 변경
+            scan_bodyframe_pub_en: true  # cloud_merger 입력 — 반드시 true
 
         pcd_save:
             pcd_save_en: false

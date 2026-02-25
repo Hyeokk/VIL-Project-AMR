@@ -5,7 +5,8 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_STANDARD 14)
+# set(CMAKE_CXX_STANDARD 14)    # [OPT] 원본
+set(CMAKE_CXX_STANDARD 17)      # [OPT] 변경 — C++17
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -pthread -fexceptions")
@@ -15,19 +16,33 @@ add_definitions(-DROOT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/")
 
 message("Current CPU architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
-  include(ProcessorCount)
-  ProcessorCount(N)
-  message("Processor number: ${N}")
-  if(N GREATER 4)
-    add_definitions(-DMP_EN)
-    add_definitions(-DMP_PROC_NUM=3)
-  elseif(N GREATER 3)
-    add_definitions(-DMP_EN)
-    add_definitions(-DMP_PROC_NUM=2)
-  else()
-    add_definitions(-DMP_PROC_NUM=1)
-  endif()
+# [OPT] 원본: x86/AMD64에서만 OpenMP 멀티코어 활성화
+# if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
+#   include(ProcessorCount)
+#   ProcessorCount(N)
+#   message("Processor number: ${N}")
+#   if(N GREATER 4)
+#     add_definitions(-DMP_EN)
+#     add_definitions(-DMP_PROC_NUM=3)
+#   elseif(N GREATER 3)
+#     add_definitions(-DMP_EN)
+#     add_definitions(-DMP_PROC_NUM=2)
+#   else()
+#     add_definitions(-DMP_PROC_NUM=1)
+#   endif()
+# else()
+#   add_definitions(-DMP_PROC_NUM=1)
+# endif()
+# [OPT] 변경: 모든 아키텍처(ARM64 IQ-9075 포함)에서 OpenMP 멀티코어 활성화
+include(ProcessorCount)
+ProcessorCount(N)
+message("Processor number: ${N}")
+if(N GREATER 4)
+  add_definitions(-DMP_EN)
+  add_definitions(-DMP_PROC_NUM=3)
+elseif(N GREATER 3)
+  add_definitions(-DMP_EN)
+  add_definitions(-DMP_PROC_NUM=2)
 else()
   add_definitions(-DMP_PROC_NUM=1)
 endif()
@@ -36,8 +51,9 @@ find_package(OpenMP QUIET)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
 
-find_package(PythonLibs REQUIRED)
-find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
+# [OPT] 원본: Python/matplotlib (런타임에서 미사용)
+# find_package(PythonLibs REQUIRED)
+# find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
 
 # ROS dependencies
 find_package(ament_cmake REQUIRED)
@@ -48,7 +64,7 @@ find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
-find_package(visualization_msgs REQUIRED)
+# find_package(visualization_msgs REQUIRED)  # [OPT] laserMapping.cpp에서 미사용
 find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -62,7 +78,7 @@ set(dependencies
   sensor_msgs
   std_msgs
   std_srvs
-  visualization_msgs
+  # visualization_msgs  # [OPT] 미사용
   pcl_ros
   pcl_conversions
   tf2_ros
@@ -90,8 +106,9 @@ target_include_directories(fastlio_mapping PUBLIC
   $<INSTALL_INTERFACE:include>
   ${PCL_INCLUDE_DIRS}
 )
-target_link_libraries(fastlio_mapping ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} Eigen3::Eigen)
-target_include_directories(fastlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
+# [OPT] 원본: target_link_libraries(fastlio_mapping ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} Eigen3::Eigen)
+# [OPT] 원본: target_include_directories(fastlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
+target_link_libraries(fastlio_mapping ${PCL_LIBRARIES} Eigen3::Eigen)  # [OPT] 변경 — Python 제거
 
 rosidl_get_typesupport_target(cpp_typesupport_target
   ${PROJECT_NAME} "rosidl_typesupport_cpp")
