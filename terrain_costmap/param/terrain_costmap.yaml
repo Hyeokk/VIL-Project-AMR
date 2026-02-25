@@ -1,0 +1,43 @@
+# terrain_costmap parameters for DONKEYBOTI AMR
+# Mountain terrain, caterpillar (skid-steer) robot
+#
+# Costmap: 3m x 3m, 0.1m resolution = 30x30 cells (900 cells)
+# Updated at GroundGrid rate (~10Hz)
+
+terrain_costmap_node:
+  ros__parameters:
+    # --- Costmap geometry ---
+    costmap_size: 3.0          # [m] side length of square costmap
+    costmap_resolution: 0.1    # [m] cell size
+    robot_frame: "base_link"
+    odom_frame: "odom"
+
+    # --- Cost weights ---
+    # Sum = 1.0 for normalized output, but not strictly required.
+    # Caterpillar robot: slope tolerance is higher, obstacle avoidance is top priority.
+    weight_obstacle: 0.40      # Non-ground point density
+    weight_slope: 0.30         # Terrain inclination
+    weight_roughness: 0.15     # Surface irregularity
+    weight_unknown: 0.15       # Unobserved / low-confidence area
+
+    # --- Thresholds ---
+    # Caterpillar can handle steeper slopes than wheeled robots (~35°)
+    slope_max_deg: 35.0        # [deg] slopes >= this → cost 1.0
+    roughness_max: 0.05        # [m²] variance >= this → cost 1.0
+    obstacle_count_max: 5.0    # obstacle points >= this → cost 1.0
+    confidence_threshold: 0.1  # groundpatch confidence below this → "unknown"
+
+    # Cells with total cost >= lethal_threshold are set to 100 (impassable)
+    lethal_threshold: 0.8
+
+    # --- Persistent terrain accumulation ---
+    enable_terrain_accumulation: true
+    terrain_max_points: 200000   # Max accumulated ground points in memory
+    terrain_radius: 10.0         # [m] Sliding window radius around robot
+    terrain_publish_rate: 1.0    # [Hz] Terrain cloud publish rate (debug/viz)
+
+    # --- Topics ---
+    gridmap_topic: "/groundgrid/grid_map"
+    filtered_cloud_topic: "/groundgrid/filtered_cloud"
+    costmap_topic: "/terrain_costmap"
+    terrain_cloud_topic: "/terrain_costmap/terrain_cloud"
