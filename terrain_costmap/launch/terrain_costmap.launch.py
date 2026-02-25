@@ -18,7 +18,7 @@ def generate_launch_description():
 
     args = [
         launch.actions.DeclareLaunchArgument(
-            'costmap_size', default_value='3.0',
+            'costmap_size', default_value='5.0',
             description='Costmap side length [m]'
         ),
         launch.actions.DeclareLaunchArgument(
