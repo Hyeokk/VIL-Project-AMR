@@ -19,6 +19,9 @@
 // Persistent terrain map:
 //   Ground points are accumulated in odom frame over time (sliding window)
 //   to fill sensor blind spots as the robot moves.
+//   When a costmap cell has no GroundGrid data (unknown), the accumulated
+//   terrain points are used as fallback to compute slope and roughness.
+//   This preserves previously observed terrain behind and beside the robot.
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
@@ -43,6 +46,20 @@
 #include <mutex>
 #include <cmath>
 #include <algorithm>
+
+// Per-cell statistics from accumulated terrain points (odom frame → robot frame)
+struct TerrainCellStats {
+    int count = 0;
+    double sum_z = 0.0;
+    double sum_z2 = 0.0;
+
+    double mean_z() const { return count > 0 ? sum_z / count : 0.0; }
+    double variance() const {
+        if (count < 2) return 0.0;
+        double m = mean_z();
+        return std::max(0.0, sum_z2 / count - m * m);
+    }
+};
 
 class TerrainCostmapNode : public rclcpp::Node
 {
@@ -269,6 +286,12 @@ private:
 
         costmap->data.resize(costmap_cells_ * costmap_cells_, -1);  // -1 = unknown
 
+        // Build terrain accumulation grid for fallback on unknown cells
+        std::vector<TerrainCellStats> terrain_grid;
+        if (enable_terrain_accum_ && terrain_cloud_ && !terrain_cloud_->empty()) {
+            terrain_grid = build_terrain_grid(tf_odom_to_robot);
+        }
+
         // Get submap layers (check existence)
         const bool has_ground = submap.exists("ground");
         const bool has_points = submap.exists("points");
@@ -363,6 +386,46 @@ private:
             }
         }
 
+        // === Fallback: fill unknown cells from accumulated terrain ===
+        if (enable_terrain_accum_ && !terrain_grid.empty()) {
+            int filled = 0;
+            for (int cy = 0; cy < costmap_cells_; ++cy) {
+                for (int cx = 0; cx < costmap_cells_; ++cx) {
+                    const int idx = cy * costmap_cells_ + cx;
+                    if (costmap->data[idx] != -1)
+                        continue;  // Already has data from GroundGrid
+
+                    const auto &tcell = terrain_grid[idx];
+                    if (tcell.count < 2)
+                        continue;  // Not enough accumulated points
+
+                    // Accumulated terrain contains ground-only points
+                    // → obstacle_cost = 0, unknown_cost = 0
+                    double roughness_cost = std::min(
+                        tcell.variance() / roughness_max_, 1.0);
+                    double slope_cost = compute_terrain_slope(
+                        terrain_grid, cx, cy);
+
+                    double total = w_slope_ * slope_cost
+                                 + w_roughness_ * roughness_cost;
+
+                    total = std::clamp(total, 0.0, 1.0);
+
+                    if (total >= lethal_threshold_) {
+                        costmap->data[idx] = 100;
+                    } else {
+                        costmap->data[idx] = static_cast<int8_t>(total * 99.0);
+                    }
+                    ++filled;
+                }
+            }
+
+            if (filled > 0) {
+                RCLCPP_DEBUG(get_logger(),
+                    "Terrain fallback filled %d unknown cells", filled);
+            }
+        }
+
         return costmap;
     }
 
@@ -389,6 +452,82 @@ private:
 
         // Normalize to [0, 1] based on max slope
         return std::min(static_cast<double>(slope_rad) / slope_max_rad_, 1.0);
+    }
+
+    // =========================================================================
+    // Terrain grid from accumulated points (for unknown-cell fallback)
+    // =========================================================================
+
+    // Build a costmap-sized grid by binning terrain_cloud_ (odom frame)
+    // into robot-frame costmap cells.
+    std::vector<TerrainCellStats> build_terrain_grid(
+        const geometry_msgs::msg::TransformStamped &tf_odom_to_robot)
+    {
+        std::vector<TerrainCellStats> grid(costmap_cells_ * costmap_cells_);
+
+        std::lock_guard<std::mutex> lock(terrain_mutex_);
+        if (!terrain_cloud_ || terrain_cloud_->empty())
+            return grid;
+
+        // tf_odom_to_robot = lookupTransform(odom, robot)
+        // This gives robot position/orientation in odom frame.
+        // To convert odom→robot: p_robot = R^T * (p_odom - t)
+        const double tx = tf_odom_to_robot.transform.translation.x;
+        const double ty = tf_odom_to_robot.transform.translation.y;
+        const double half = costmap_size_ / 2.0;
+
+        for (const auto &pt : terrain_cloud_->points) {
+            // Odom → robot frame (2D rotation using cached yaw)
+            const double dx = pt.x - tx;
+            const double dy = pt.y - ty;
+            const double rx =  cos_yaw_ * dx + sin_yaw_ * dy;
+            const double ry = -sin_yaw_ * dx + cos_yaw_ * dy;
+
+            // Check if within costmap bounds
+            if (rx < -half || rx >= half || ry < -half || ry >= half)
+                continue;
+
+            // Convert to grid cell index
+            const int cx = static_cast<int>((rx + half) / costmap_resolution_);
+            const int cy = static_cast<int>((ry + half) / costmap_resolution_);
+
+            if (cx < 0 || cx >= costmap_cells_ || cy < 0 || cy >= costmap_cells_)
+                continue;
+
+            auto &cell = grid[cy * costmap_cells_ + cx];
+            cell.count++;
+            cell.sum_z += pt.z;
+            cell.sum_z2 += pt.z * pt.z;
+        }
+
+        return grid;
+    }
+
+    // Compute slope from terrain grid mean elevations using central difference
+    double compute_terrain_slope(
+        const std::vector<TerrainCellStats> &tgrid, int cx, int cy) const
+    {
+        if (cx < 1 || cy < 1 || cx >= costmap_cells_ - 1 || cy >= costmap_cells_ - 1)
+            return 0.0;
+
+        const auto &left  = tgrid[cy * costmap_cells_ + (cx - 1)];
+        const auto &right = tgrid[cy * costmap_cells_ + (cx + 1)];
+        const auto &down  = tgrid[(cy - 1) * costmap_cells_ + cx];
+        const auto &up    = tgrid[(cy + 1) * costmap_cells_ + cx];
+
+        // Need neighbors to have data for gradient computation
+        if (left.count == 0 || right.count == 0 ||
+            down.count == 0 || up.count == 0)
+            return 0.0;
+
+        const double dz_dx = (right.mean_z() - left.mean_z())
+                            / (2.0 * costmap_resolution_);
+        const double dz_dy = (up.mean_z() - down.mean_z())
+                            / (2.0 * costmap_resolution_);
+        const double slope_rad = std::atan(
+            std::sqrt(dz_dx * dz_dx + dz_dy * dz_dy));
+
+        return std::min(slope_rad / slope_max_rad_, 1.0);
     }
 
     // =========================================================================

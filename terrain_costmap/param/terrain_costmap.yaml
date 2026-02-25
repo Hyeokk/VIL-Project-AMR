@@ -7,7 +7,7 @@
 terrain_costmap_node:
   ros__parameters:
     # --- Costmap geometry ---
-    costmap_size: 3.0          # [m] side length of square costmap
+    costmap_size: 5.0          # [m] side length of square costmap
     costmap_resolution: 0.1    # [m] cell size
     robot_frame: "base_link"
     odom_frame: "odom"
