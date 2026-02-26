@@ -19,15 +19,10 @@
 // TF Required:
 //   odom → base_link  (from FAST-LIO2 or wheel odometry)
 //
-// Behavior:
-//   1. Receive goal in odom frame
-//   2. A* plans on costmap (robot-centric grid → global waypoints)
-//   3. Global path cached in odom frame; replan only on new goal / deviation / periodic
-//   4. Pure Pursuit selects lookahead on stable cached path
-//   5. DWA selects (v, ω) toward pure pursuit target while avoiding obstacles
-//   6. Large heading error → DWA naturally selects turn-in-place (v≈0)
-//   7. Goal outside costmap → intermediate waypoint at costmap boundary
-//   8. No valid trajectory → emergency stop (v=0, ω=0)
+// [v3] Fixes:
+//   - Goal frame: transform any frame to odom on receipt
+//   - DWA scoring: forward-bias to prevent unnecessary spinning
+//   - Robot footprint: oriented rectangular collision check
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
@@ -38,6 +33,7 @@
 #include <tf2_ros/transform_listener.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include <cmath>
 #include <vector>
@@ -79,15 +75,6 @@ struct AStarEntry {
 };
 
 // =========================================================================
-// DWA trajectory candidate
-// =========================================================================
-struct Trajectory {
-    double v, w;           // linear, angular velocity
-    double score;          // evaluation score
-    std::vector<std::pair<double, double>> points;  // (x, y) for visualization
-};
-
-// =========================================================================
 // PathPlannerNode
 // =========================================================================
 class PathPlannerNode : public rclcpp::Node
@@ -110,12 +97,17 @@ public:
             n_v_samples_, n_w_samples_, n_v_samples_ * n_w_samples_,
             sim_time_, sim_granularity_);
         RCLCPP_INFO(get_logger(),
-            "Path caching: replan_interval=%.1fs, deviation_threshold=%.2fm, "
-            "pure_pursuit_lookahead=%.2fm",
+            "Robot footprint: %.3f x %.3f m, clearance=%.2fm",
+            robot_length_, robot_width_, clearance_margin_);
+        RCLCPP_INFO(get_logger(),
+            "Path caching: replan=%.1fs, deviation=%.2fm, lookahead=%.2fm",
             replan_interval_, path_deviation_threshold_, pure_pursuit_lookahead_);
+        RCLCPP_INFO(get_logger(),
+            "DWA weights: heading=%.2f, clearance=%.2f, velocity=%.2f, path=%.2f, spin_thresh=%.1f°",
+            w_heading_, w_clearance_, w_velocity_, w_path_dist_,
+            spin_heading_threshold_ * 180.0 / M_PI);
     }
 
-    // ── 종료 시 반드시 정지 명령 발행 ──
     ~PathPlannerNode() override
     {
         send_stop_command();
@@ -125,9 +117,6 @@ public:
     {
         RCLCPP_INFO(get_logger(), "Shutdown: sending stop command to /cmd_vel");
         geometry_msgs::msg::Twist stop;
-        stop.linear.x = 0.0;
-        stop.angular.z = 0.0;
-        // 여러 번 발행하여 확실히 수신되도록 함
         for (int i = 0; i < 10; ++i) {
             pub_cmd_->publish(stop);
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -140,64 +129,58 @@ private:
     // =====================================================================
     void declare_parameters()
     {
-        // Costmap (must match terrain_costmap_node)
         declare_parameter<double>("costmap_size", 5.0);
         declare_parameter<double>("costmap_resolution", 0.1);
 
-        // Robot kinematics (DONKEYBOTI.yaml)
         declare_parameter<double>("max_lin_vel", 0.6);
-        declare_parameter<double>("min_lin_vel", -0.2);     // limited reverse
+        declare_parameter<double>("min_lin_vel", -0.2);
         declare_parameter<double>("max_ang_vel", 0.5);
         declare_parameter<double>("max_lin_acc", 1.0);
         declare_parameter<double>("max_ang_acc", 2.0);
 
-        // DWA parameters
         declare_parameter<int>("n_v_samples", 11);
-        declare_parameter<int>("n_w_samples", 21);          // more ω for turn-in-place
-        declare_parameter<double>("sim_time", 1.5);         // forward simulation [s]
-        declare_parameter<double>("sim_granularity", 0.1);  // simulation step [s]
+        declare_parameter<int>("n_w_samples", 21);
+        declare_parameter<double>("sim_time", 1.5);
+        declare_parameter<double>("sim_granularity", 0.1);
 
-        // DWA scoring weights
-        declare_parameter<double>("weight_heading", 1.0);   // alignment to A* path
-        declare_parameter<double>("weight_clearance", 0.5); // obstacle distance
-        declare_parameter<double>("weight_velocity", 0.3);  // prefer forward motion
-        declare_parameter<double>("weight_path_dist", 0.8); // distance to A* path
+        // [v3] Rebalanced defaults
+        declare_parameter<double>("weight_heading", 0.6);
+        declare_parameter<double>("weight_clearance", 0.5);
+        declare_parameter<double>("weight_velocity", 0.8);
+        declare_parameter<double>("weight_path_dist", 0.8);
 
-        // Goal tolerance
-        declare_parameter<double>("goal_xy_tolerance", 0.2);    // [m]
-        declare_parameter<double>("goal_yaw_tolerance", 0.15);  // [rad] ~8.6°
+        declare_parameter<double>("goal_xy_tolerance", 0.2);
+        declare_parameter<double>("goal_yaw_tolerance", 0.15);
 
-        // A* configuration
-        declare_parameter<double>("astar_lethal_cost", 80.0);   // cells >= this are blocked
-        declare_parameter<double>("astar_cost_weight", 2.0);    // terrain cost penalty
+        declare_parameter<double>("astar_lethal_cost", 90.0);
+        declare_parameter<double>("astar_cost_weight", 1.0);
 
-        // Safety
-        declare_parameter<double>("robot_radius", 0.35);    // [m] collision check radius
-        declare_parameter<double>("clearance_margin", 0.1); // [m] extra safety margin
+        // [v3] Rectangular footprint
+        declare_parameter<double>("robot_length", 1.432);
+        declare_parameter<double>("robot_width", 0.850);
+        declare_parameter<double>("clearance_margin", 0.1);
 
-        // Control rate
-        declare_parameter<double>("control_rate", 20.0);    // [Hz]
+        declare_parameter<double>("control_rate", 20.0);
 
-        // Frames
         declare_parameter<std::string>("odom_frame", "odom");
         declare_parameter<std::string>("robot_frame", "base_link");
 
-        // Topics
         declare_parameter<std::string>("costmap_topic", "/terrain_costmap");
         declare_parameter<std::string>("goal_topic", "/goal_pose");
         declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
 
-        // Slope speed reduction (IMU-based, future extension)
-        declare_parameter<double>("slope_speed_factor", 0.5);  // reduce max_v on slope
+        declare_parameter<double>("slope_speed_factor", 0.5);
         declare_parameter<double>("slope_threshold_deg", 15.0);
 
-        // === NEW: Path caching & Pure Pursuit ===
-        declare_parameter<double>("replan_interval", 1.0);             // [s] periodic A* replan
-        declare_parameter<double>("path_deviation_threshold", 0.5);    // [m] replan if robot deviates
-        declare_parameter<double>("pure_pursuit_lookahead", 0.4);      // [m] pure pursuit lookahead distance
-        declare_parameter<double>("pure_pursuit_lookahead_min", 0.2);  // [m] minimum lookahead
-        declare_parameter<double>("pure_pursuit_lookahead_max", 0.8);  // [m] maximum lookahead
-        declare_parameter<double>("velocity_lookahead_gain", 0.5);     // lookahead scales with speed
+        declare_parameter<double>("replan_interval", 1.0);
+        declare_parameter<double>("path_deviation_threshold", 0.5);
+        declare_parameter<double>("pure_pursuit_lookahead", 0.4);
+        declare_parameter<double>("pure_pursuit_lookahead_min", 0.2);
+        declare_parameter<double>("pure_pursuit_lookahead_max", 0.8);
+        declare_parameter<double>("velocity_lookahead_gain", 0.5);
+
+        // [v3]
+        declare_parameter<double>("spin_heading_threshold", 1.05);
     }
 
     void load_parameters()
@@ -228,7 +211,9 @@ private:
         astar_lethal_ = get_parameter("astar_lethal_cost").as_double();
         astar_cost_weight_ = get_parameter("astar_cost_weight").as_double();
 
-        robot_radius_ = get_parameter("robot_radius").as_double();
+        // [v3] Rectangular footprint
+        robot_length_ = get_parameter("robot_length").as_double();
+        robot_width_ = get_parameter("robot_width").as_double();
         clearance_margin_ = get_parameter("clearance_margin").as_double();
 
         control_rate_ = get_parameter("control_rate").as_double();
@@ -239,13 +224,14 @@ private:
         slope_speed_factor_ = get_parameter("slope_speed_factor").as_double();
         slope_threshold_deg_ = get_parameter("slope_threshold_deg").as_double();
 
-        // NEW
         replan_interval_ = get_parameter("replan_interval").as_double();
         path_deviation_threshold_ = get_parameter("path_deviation_threshold").as_double();
         pure_pursuit_lookahead_ = get_parameter("pure_pursuit_lookahead").as_double();
         pure_pursuit_lookahead_min_ = get_parameter("pure_pursuit_lookahead_min").as_double();
         pure_pursuit_lookahead_max_ = get_parameter("pure_pursuit_lookahead_max").as_double();
         velocity_lookahead_gain_ = get_parameter("velocity_lookahead_gain").as_double();
+
+        spin_heading_threshold_ = get_parameter("spin_heading_threshold").as_double();
     }
 
     // =====================================================================
@@ -295,58 +281,92 @@ private:
         costmap_ = msg;
     }
 
+    // [v3] Goal: transform any frame → odom
     void goal_callback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
     {
-        goal_ = *msg;
+        geometry_msgs::msg::PoseStamped goal_odom;
+
+        if (msg->header.frame_id == odom_frame_ || msg->header.frame_id.empty()) {
+            goal_odom = *msg;
+            goal_odom.header.frame_id = odom_frame_;
+        } else {
+            // Try TF transform first
+            try {
+                goal_odom = tf_buffer_->transform(
+                    *msg, odom_frame_, tf2::durationFromSec(0.2));
+            } catch (tf2::TransformException &ex) {
+                // Fallback: assume robot-frame goal, manually transform
+                double robot_x, robot_y, robot_yaw;
+                if (!get_robot_pose(robot_x, robot_y, robot_yaw)) {
+                    RCLCPP_ERROR(get_logger(),
+                        "Cannot transform goal from '%s' to '%s': %s",
+                        msg->header.frame_id.c_str(), odom_frame_.c_str(), ex.what());
+                    return;
+                }
+                double lx = msg->pose.position.x;
+                double ly = msg->pose.position.y;
+                double cos_y = std::cos(robot_yaw);
+                double sin_y = std::sin(robot_yaw);
+
+                goal_odom.header.stamp = msg->header.stamp;
+                goal_odom.header.frame_id = odom_frame_;
+                goal_odom.pose.position.x = cos_y * lx - sin_y * ly + robot_x;
+                goal_odom.pose.position.y = sin_y * lx + cos_y * ly + robot_y;
+                goal_odom.pose.position.z = 0.0;
+
+                double goal_yaw_local = get_yaw_from_quat(msg->pose.orientation);
+                double goal_yaw_odom = robot_yaw + goal_yaw_local;
+                tf2::Quaternion q;
+                q.setRPY(0, 0, goal_yaw_odom);
+                goal_odom.pose.orientation.x = q.x();
+                goal_odom.pose.orientation.y = q.y();
+                goal_odom.pose.orientation.z = q.z();
+                goal_odom.pose.orientation.w = q.w();
+
+                RCLCPP_WARN(get_logger(),
+                    "TF failed, manual transform from '%s' → odom",
+                    msg->header.frame_id.c_str());
+            }
+        }
+
+        goal_ = goal_odom;
         goal_active_ = true;
-        need_replan_ = true;  // NEW: force replan on new goal
-        RCLCPP_INFO(get_logger(), "New goal: (%.2f, %.2f) in frame '%s'",
-            msg->pose.position.x, msg->pose.position.y,
+        need_replan_ = true;
+
+        RCLCPP_INFO(get_logger(),
+            "New goal: (%.2f, %.2f) in odom [source: '%s']",
+            goal_odom.pose.position.x, goal_odom.pose.position.y,
             msg->header.frame_id.c_str());
     }
 
     // =====================================================================
-    // Check if replanning is needed
+    // Replan check
     // =====================================================================
     bool should_replan(double robot_x, double robot_y)
     {
-        // (1) Forced replan (new goal)
         if (need_replan_) {
             need_replan_ = false;
             return true;
         }
+        if (cached_global_path_odom_.empty()) return true;
 
-        // (2) No cached path
-        if (cached_global_path_odom_.empty()) {
-            return true;
-        }
+        double elapsed = (get_clock()->now() - last_replan_time_).seconds();
+        if (elapsed >= replan_interval_) return true;
 
-        // (3) Periodic replan
-        auto now = get_clock()->now();
-        double elapsed = (now - last_replan_time_).seconds();
-        if (elapsed >= replan_interval_) {
-            return true;
-        }
-
-        // (4) Robot deviated too far from cached path
         double min_dist = std::numeric_limits<double>::max();
         for (const auto &wp : cached_global_path_odom_) {
             double d = std::hypot(robot_x - wp.first, robot_y - wp.second);
             min_dist = std::min(min_dist, d);
         }
         if (min_dist > path_deviation_threshold_) {
-            RCLCPP_INFO(get_logger(),
-                "Path deviation %.2fm > threshold %.2fm — replanning",
-                min_dist, path_deviation_threshold_);
+            RCLCPP_INFO(get_logger(), "Path deviation %.2fm — replanning", min_dist);
             return true;
         }
-
         return false;
     }
 
     // =====================================================================
-    // Pure Pursuit: find lookahead point on cached odom-frame path
-    // Returns lookahead in robot-local coordinates
+    // Pure Pursuit: find lookahead on cached odom-frame path
     // =====================================================================
     bool find_pure_pursuit_target(
         double robot_x, double robot_y, double robot_yaw,
@@ -354,14 +374,13 @@ private:
     {
         if (cached_global_path_odom_.empty()) return false;
 
-        // Adaptive lookahead: scales with velocity
         double lookahead = pure_pursuit_lookahead_
                          + velocity_lookahead_gain_ * std::abs(cur_v_);
         lookahead = std::clamp(lookahead,
                               pure_pursuit_lookahead_min_,
                               pure_pursuit_lookahead_max_);
 
-        // Find the closest point on path to robot
+        // Find closest point
         size_t closest_idx = 0;
         double closest_dist = std::numeric_limits<double>::max();
         for (size_t i = 0; i < cached_global_path_odom_.size(); ++i) {
@@ -374,27 +393,24 @@ private:
             }
         }
 
-        // Walk forward along path from closest point to find lookahead target
-        double accum_dist = 0.0;
+        // Walk forward along path
+        double accum = 0.0;
         size_t target_idx = closest_idx;
         for (size_t i = closest_idx; i + 1 < cached_global_path_odom_.size(); ++i) {
-            double dx = cached_global_path_odom_[i+1].first - cached_global_path_odom_[i].first;
-            double dy = cached_global_path_odom_[i+1].second - cached_global_path_odom_[i].second;
-            accum_dist += std::hypot(dx, dy);
+            double ddx = cached_global_path_odom_[i+1].first - cached_global_path_odom_[i].first;
+            double ddy = cached_global_path_odom_[i+1].second - cached_global_path_odom_[i].second;
+            accum += std::hypot(ddx, ddy);
             target_idx = i + 1;
-            if (accum_dist >= lookahead) break;
+            if (accum >= lookahead) break;
         }
 
-        // Transform target to robot-local frame
-        double tx_odom = cached_global_path_odom_[target_idx].first;
-        double ty_odom = cached_global_path_odom_[target_idx].second;
-        double dx = tx_odom - robot_x;
-        double dy = ty_odom - robot_y;
+        // Transform to robot-local
+        double ddx = cached_global_path_odom_[target_idx].first - robot_x;
+        double ddy = cached_global_path_odom_[target_idx].second - robot_y;
         double cos_y = std::cos(-robot_yaw);
         double sin_y = std::sin(-robot_yaw);
-        target_local_x = cos_y * dx - sin_y * dy;
-        target_local_y = sin_y * dx + cos_y * dy;
-
+        target_local_x = cos_y * ddx - sin_y * ddy;
+        target_local_y = sin_y * ddx + cos_y * ddy;
         return true;
     }
 
@@ -403,165 +419,115 @@ private:
     // =====================================================================
     void control_loop()
     {
-        // goal이 없으면 매 사이클 정지 명령을 계속 발행하여
-        // 확실한 정지 상태를 유지 (다음 goal_pose가 올 때까지)
         if (!goal_active_) {
             publish_stop();
             return;
         }
 
-        // 1. Get latest costmap
+        // 1. Costmap
         nav_msgs::msg::OccupancyGrid::ConstSharedPtr costmap;
         {
             std::lock_guard<std::mutex> lock(costmap_mutex_);
             costmap = costmap_;
         }
         if (!costmap) {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
-                "No costmap received yet");
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000, "No costmap yet");
             return;
         }
 
-        // 2. Get robot pose in odom frame
+        // 2. Robot pose
         double robot_x, robot_y, robot_yaw;
-        if (!get_robot_pose(robot_x, robot_y, robot_yaw))
+        if (!get_robot_pose(robot_x, robot_y, robot_yaw)) return;
+
+        // 3. Goal (already in odom frame)
+        double goal_x = goal_.pose.position.x;
+        double goal_y = goal_.pose.position.y;
+
+        double dx = goal_x - robot_x;
+        double dy = goal_y - robot_y;
+        double dist = std::hypot(dx, dy);
+
+        // 4. Goal reached? — position only, no yaw alignment
+        if (dist < goal_xy_tol_) {
+            publish_stop();
+            goal_active_ = false;
+            cached_global_path_odom_.clear();
+            RCLCPP_INFO(get_logger(), "Goal reached! (dist=%.2fm)", dist);
             return;
-
-        // 3. Compute goal in robot frame
-        double goal_x_odom = goal_.pose.position.x;
-        double goal_y_odom = goal_.pose.position.y;
-        double goal_yaw = get_yaw_from_quat(goal_.pose.orientation);
-
-        double dx = goal_x_odom - robot_x;
-        double dy = goal_y_odom - robot_y;
-        double dist_to_goal = std::hypot(dx, dy);
-
-        // 4. Check if goal reached
-        if (dist_to_goal < goal_xy_tol_) {
-            double yaw_err = std::abs(normalize_angle(goal_yaw - robot_yaw));
-            if (yaw_err < goal_yaw_tol_) {
-                // Goal reached
-                publish_stop();
-                goal_active_ = false;
-                cached_global_path_odom_.clear();
-                RCLCPP_INFO(get_logger(), "Goal reached!");
-                return;
-            } else {
-                // Position reached, align heading
-                double w = std::clamp(
-                    normalize_angle(goal_yaw - robot_yaw) * 1.5,
-                    -max_ang_vel_, max_ang_vel_);
-                publish_cmd(0.0, w);
-                return;
-            }
         }
 
-        // ============================================================
-        // 5. A* REPLAN ONLY WHEN NEEDED (not every cycle!)
-        // ============================================================
+        // 5. A* replan
         if (should_replan(robot_x, robot_y)) {
-            // Transform goal to robot-local costmap coordinates
-            double goal_local_x = std::cos(-robot_yaw) * dx - std::sin(-robot_yaw) * dy;
-            double goal_local_y = std::sin(-robot_yaw) * dx + std::cos(-robot_yaw) * dy;
+            double cos_ny = std::cos(-robot_yaw);
+            double sin_ny = std::sin(-robot_yaw);
+            double goal_lx = cos_ny * dx - sin_ny * dy;
+            double goal_ly = sin_ny * dx + cos_ny * dy;
 
-            // Project goal to costmap boundary if outside
             double half = costmap_size_ / 2.0;
             double margin = costmap_resolution_ * 2;
-            bool goal_in_costmap = (std::abs(goal_local_x) < half - margin &&
-                                    std::abs(goal_local_y) < half - margin);
+            double plan_lx = goal_lx, plan_ly = goal_ly;
 
-            double plan_local_x = goal_local_x;
-            double plan_local_y = goal_local_y;
-            if (!goal_in_costmap) {
-                double angle = std::atan2(goal_local_y, goal_local_x);
-                double boundary = half - margin;
-                plan_local_x = boundary * std::cos(angle);
-                plan_local_y = boundary * std::sin(angle);
+            if (std::abs(goal_lx) >= half - margin || std::abs(goal_ly) >= half - margin) {
+                double angle = std::atan2(goal_ly, goal_lx);
+                double bnd = half - margin;
+                plan_lx = bnd * std::cos(angle);
+                plan_ly = bnd * std::sin(angle);
             }
 
-            // Convert local coords to grid indices
-            int start_r = grid_cells_ / 2;
-            int start_c = grid_cells_ / 2;
-            int goal_r = static_cast<int>((plan_local_y + half) / costmap_resolution_);
-            int goal_c = static_cast<int>((plan_local_x + half) / costmap_resolution_);
+            int start_r = grid_cells_ / 2, start_c = grid_cells_ / 2;
+            int goal_r = std::clamp(static_cast<int>((plan_ly + half) / costmap_resolution_), 1, grid_cells_ - 2);
+            int goal_c = std::clamp(static_cast<int>((plan_lx + half) / costmap_resolution_), 1, grid_cells_ - 2);
 
-            goal_r = std::clamp(goal_r, 1, grid_cells_ - 2);
-            goal_c = std::clamp(goal_c, 1, grid_cells_ - 2);
-
-            // A* global path
             auto grid_path = astar_plan(costmap, {start_r, start_c}, {goal_r, goal_c});
-
             if (grid_path.empty()) {
-                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                    "A* found no path — stopping");
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "A* no path — stop");
                 publish_stop();
                 return;
             }
 
-            // Convert grid path to local coordinates
-            std::vector<std::pair<double, double>> waypoints_local;
-            waypoints_local.reserve(grid_path.size());
-            for (const auto &cell : grid_path) {
-                double lx = (cell.c + 0.5) * costmap_resolution_ - half;
-                double ly = (cell.r + 0.5) * costmap_resolution_ - half;
-                waypoints_local.emplace_back(lx, ly);
-            }
-
-            // *** Convert to odom frame and cache ***
+            // Grid → odom
             double cos_y = std::cos(robot_yaw);
             double sin_y = std::sin(robot_yaw);
             cached_global_path_odom_.clear();
-            cached_global_path_odom_.reserve(waypoints_local.size());
-            for (const auto &[lx, ly] : waypoints_local) {
-                double ox = cos_y * lx - sin_y * ly + robot_x;
-                double oy = sin_y * lx + cos_y * ly + robot_y;
-                cached_global_path_odom_.emplace_back(ox, oy);
+            cached_global_path_odom_.reserve(grid_path.size());
+            for (const auto &cell : grid_path) {
+                double lx = (cell.c + 0.5) * costmap_resolution_ - half;
+                double ly = (cell.r + 0.5) * costmap_resolution_ - half;
+                cached_global_path_odom_.emplace_back(
+                    cos_y * lx - sin_y * ly + robot_x,
+                    sin_y * lx + cos_y * ly + robot_y);
             }
-
             last_replan_time_ = get_clock()->now();
-
-            RCLCPP_DEBUG(get_logger(), "A* replanned: %zu waypoints",
-                cached_global_path_odom_.size());
         }
 
-        // 6. Publish cached global path for visualization
-        if (!cached_global_path_odom_.empty()) {
+        // 6. Publish global path
+        if (!cached_global_path_odom_.empty())
             publish_global_path_odom(cached_global_path_odom_, now());
-        }
 
-        // ============================================================
-        // 7. Pure Pursuit: find stable lookahead on cached path
-        // ============================================================
-        double pursuit_local_x, pursuit_local_y;
-        if (!find_pure_pursuit_target(robot_x, robot_y, robot_yaw,
-                                       pursuit_local_x, pursuit_local_y))
-        {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                "No pure pursuit target — stopping");
+        // 7. Pure Pursuit target
+        double pursuit_lx, pursuit_ly;
+        if (!find_pure_pursuit_target(robot_x, robot_y, robot_yaw, pursuit_lx, pursuit_ly)) {
             publish_stop();
             return;
         }
 
-        // 8. Convert cached path to robot-local for DWA collision checking
-        double cos_neg_yaw = std::cos(-robot_yaw);
-        double sin_neg_yaw = std::sin(-robot_yaw);
+        // 8. Local path for DWA
+        double cos_ny = std::cos(-robot_yaw);
+        double sin_ny = std::sin(-robot_yaw);
         std::vector<std::pair<double, double>> local_path;
         local_path.reserve(cached_global_path_odom_.size());
         for (const auto &[ox, oy] : cached_global_path_odom_) {
-            double lx = cos_neg_yaw * (ox - robot_x) - sin_neg_yaw * (oy - robot_y);
-            double ly = sin_neg_yaw * (ox - robot_x) + cos_neg_yaw * (oy - robot_y);
-            local_path.emplace_back(lx, ly);
+            local_path.emplace_back(
+                cos_ny * (ox - robot_x) - sin_ny * (oy - robot_y),
+                sin_ny * (ox - robot_x) + cos_ny * (oy - robot_y));
         }
 
-        // 9. DWA local planning (using pure pursuit target instead of raw goal)
-        auto [best_v, best_w, best_traj] = dwa_plan(costmap, local_path,
-            pursuit_local_x, pursuit_local_y);
+        // 9. DWA
+        auto [best_v, best_w, best_traj] = dwa_plan(costmap, local_path, pursuit_lx, pursuit_ly);
 
-        // Publish local trajectory for visualization
-        publish_local_trajectory(best_traj, now(),
-            robot_x, robot_y, robot_yaw);
+        publish_local_trajectory(best_traj, now(), robot_x, robot_y, robot_yaw);
 
-        // 10. Publish command
+        // 10. Command
         publish_cmd(best_v, best_w);
     }
 
@@ -576,19 +542,16 @@ private:
         const int cols = costmap->info.width;
         const auto &data = costmap->data;
 
-        // Validate start/goal
         auto get_cost = [&](int r, int c) -> int {
             if (r < 0 || r >= rows || c < 0 || c >= cols) return 127;
             return data[r * cols + c];
         };
 
         if (get_cost(goal.r, goal.c) >= static_cast<int>(astar_lethal_)) {
-            // Goal cell is blocked — find nearest free cell
             goal = find_nearest_free(costmap, goal);
             if (goal.r < 0) return {};
         }
 
-        // Priority queue
         std::priority_queue<AStarEntry, std::vector<AStarEntry>,
                            std::greater<AStarEntry>> open;
         std::unordered_map<Cell, double, CellHash> g_score;
@@ -597,7 +560,6 @@ private:
         g_score[start] = 0.0;
         open.push({heuristic(start, goal), start});
 
-        // 8-connected neighbors
         static const int dr[] = {-1, -1, -1, 0, 0, 1, 1, 1};
         static const int dc[] = {-1, 0, 1, -1, 1, -1, 0, 1};
         static const double move_cost[] = {
@@ -608,29 +570,22 @@ private:
             auto [f, current] = open.top();
             open.pop();
 
-            if (current == goal) {
+            if (current == goal)
                 return reconstruct_path(came_from, start, goal);
-            }
 
-            // Skip if we already found a better path
             auto it = g_score.find(current);
             if (it != g_score.end() && f - heuristic(current, goal) > it->second + 1e-6)
                 continue;
 
             for (int i = 0; i < 8; ++i) {
                 Cell nb = {current.r + dr[i], current.c + dc[i]};
-                if (nb.r < 0 || nb.r >= rows || nb.c < 0 || nb.c >= cols)
-                    continue;
+                if (nb.r < 0 || nb.r >= rows || nb.c < 0 || nb.c >= cols) continue;
 
-                int cell_cost = get_cost(nb.r, nb.c);
-                if (cell_cost < 0 || cell_cost >= static_cast<int>(astar_lethal_))
-                    continue;  // unknown(-1) or lethal
+                int cc = get_cost(nb.r, nb.c);
+                if (cc < 0 || cc >= static_cast<int>(astar_lethal_)) continue;
 
-                // Terrain-aware cost: higher cost cells are more expensive
-                double terrain_penalty = static_cast<double>(cell_cost) / 100.0
-                                       * astar_cost_weight_;
-                double tentative = g_score[current]
-                                 + move_cost[i] * (1.0 + terrain_penalty);
+                double penalty = static_cast<double>(cc) / 100.0 * astar_cost_weight_;
+                double tentative = g_score[current] + move_cost[i] * (1.0 + penalty);
 
                 auto git = g_score.find(nb);
                 if (git == g_score.end() || tentative < git->second) {
@@ -640,16 +595,13 @@ private:
                 }
             }
         }
-
-        return {};  // No path found
+        return {};
     }
 
     double heuristic(const Cell &a, const Cell &b) const
     {
-        // Octile distance
-        int dx = std::abs(a.c - b.c);
-        int dy = std::abs(a.r - b.r);
-        return std::max(dx, dy) + (M_SQRT2 - 1.0) * std::min(dx, dy);
+        int ddx = std::abs(a.c - b.c), ddy = std::abs(a.r - b.r);
+        return std::max(ddx, ddy) + (M_SQRT2 - 1.0) * std::min(ddx, ddy);
     }
 
     std::vector<Cell> reconstruct_path(
@@ -657,12 +609,12 @@ private:
         const Cell &start, const Cell &goal)
     {
         std::vector<Cell> path;
-        Cell current = goal;
-        while (!(current == start)) {
-            path.push_back(current);
-            auto it = came_from.find(current);
+        Cell cur = goal;
+        while (!(cur == start)) {
+            path.push_back(cur);
+            auto it = came_from.find(cur);
             if (it == came_from.end()) break;
-            current = it->second;
+            cur = it->second;
         }
         path.push_back(start);
         std::reverse(path.begin(), path.end());
@@ -677,17 +629,14 @@ private:
         const int cols = costmap->info.width;
         const auto &data = costmap->data;
 
-        // BFS spiral outward from target
-        for (int radius = 1; radius < std::max(rows, cols) / 2; ++radius) {
-            for (int dr = -radius; dr <= radius; ++dr) {
-                for (int dc = -radius; dc <= radius; ++dc) {
-                    if (std::abs(dr) != radius && std::abs(dc) != radius)
-                        continue;
-                    int nr = target.r + dr;
-                    int nc = target.c + dc;
+        for (int rad = 1; rad < std::max(rows, cols) / 2; ++rad) {
+            for (int dr = -rad; dr <= rad; ++dr) {
+                for (int dc = -rad; dc <= rad; ++dc) {
+                    if (std::abs(dr) != rad && std::abs(dc) != rad) continue;
+                    int nr = target.r + dr, nc = target.c + dc;
                     if (nr >= 0 && nr < rows && nc >= 0 && nc < cols) {
-                        int cost = data[nr * cols + nc];
-                        if (cost >= 0 && cost < static_cast<int>(astar_lethal_))
+                        int c = data[nr * cols + nc];
+                        if (c >= 0 && c < static_cast<int>(astar_lethal_))
                             return {nr, nc};
                     }
                 }
@@ -697,7 +646,7 @@ private:
     }
 
     // =====================================================================
-    // DWA Local Planner
+    // DWA Local Planner  [v3: anti-spin + rectangular footprint]
     // =====================================================================
     struct DWAResult {
         double v, w;
@@ -709,7 +658,6 @@ private:
         const std::vector<std::pair<double, double>> &global_path,
         double goal_local_x, double goal_local_y)
     {
-        // Dynamic window from current velocity
         double dt = 1.0 / control_rate_;
         double v_min = std::max(min_lin_vel_, cur_v_ - max_lin_acc_ * dt);
         double v_max = std::min(max_lin_vel_, cur_v_ + max_lin_acc_ * dt);
@@ -718,6 +666,23 @@ private:
 
         const int sim_steps = static_cast<int>(std::round(sim_time_ / sim_granularity_));
         const double half = costmap_size_ / 2.0;
+        const int lethal = static_cast<int>(astar_lethal_);
+
+        // [v3] Heading error to pure pursuit target (for spin decision)
+        double heading_to_goal = std::atan2(goal_local_y, goal_local_x);
+        double abs_heading_err = std::abs(heading_to_goal);
+
+        // [v3] Rectangular footprint sample points (robot frame)
+        // Pre-compute footprint cells to check at each simulation step
+        double half_l = robot_length_ / 2.0 + clearance_margin_;
+        double half_w = robot_width_ / 2.0 + clearance_margin_;
+        struct FPPoint { double x, y; };
+        std::vector<FPPoint> footprint_pts;
+        for (double fx = -half_l; fx <= half_l; fx += costmap_resolution_) {
+            for (double fy = -half_w; fy <= half_w; fy += costmap_resolution_) {
+                footprint_pts.push_back({fx, fy});
+            }
+        }
 
         double best_score = -std::numeric_limits<double>::infinity();
         double best_v = 0.0, best_w = 0.0;
@@ -729,7 +694,6 @@ private:
             for (int wi = 0; wi < n_w_samples_; ++wi) {
                 double w = w_min + (w_max - w_min) * wi / std::max(n_w_samples_ - 1, 1);
 
-                // Forward simulate trajectory
                 double x = 0.0, y = 0.0, theta = 0.0;
                 bool collision = false;
                 double min_clearance = std::numeric_limits<double>::max();
@@ -742,88 +706,85 @@ private:
                     theta += w * sim_granularity_;
                     traj.emplace_back(x, y);
 
-                    // Collision check in costmap
+                    // Center cell check
                     int gc = static_cast<int>((x + half) / costmap_resolution_);
                     int gr = static_cast<int>((y + half) / costmap_resolution_);
-
                     if (gc < 0 || gc >= grid_cells_ || gr < 0 || gr >= grid_cells_) {
-                        // Outside costmap — penalize but don't block
                         min_clearance = std::min(min_clearance, 0.1);
                         continue;
                     }
+                    int cc_val = costmap->data[gr * grid_cells_ + gc];
+                    if (cc_val >= lethal) { collision = true; break; }
 
-                    int cell_cost = costmap->data[gr * grid_cells_ + gc];
-                    if (cell_cost >= static_cast<int>(astar_lethal_)) {
-                        collision = true;
-                        break;
-                    }
-
-                    // Robot radius collision check
-                    int radius_cells = static_cast<int>(
-                        std::ceil((robot_radius_ + clearance_margin_) / costmap_resolution_));
-                    bool radius_collision = false;
-                    for (int dr = -radius_cells; dr <= radius_cells && !radius_collision; ++dr) {
-                        for (int dc = -radius_cells; dc <= radius_cells && !radius_collision; ++dc) {
-                            if (dr * dr + dc * dc > radius_cells * radius_cells)
-                                continue;
-                            int cr = gr + dr;
-                            int cc = gc + dc;
-                            if (cr >= 0 && cr < grid_cells_ && cc >= 0 && cc < grid_cells_) {
-                                if (costmap->data[cr * grid_cells_ + cc] >= static_cast<int>(astar_lethal_)) {
-                                    radius_collision = true;
-                                }
+                    // [v3] Oriented rectangular footprint check
+                    double cos_t = std::cos(theta);
+                    double sin_t = std::sin(theta);
+                    bool fp_hit = false;
+                    for (const auto &fp : footprint_pts) {
+                        double wx = x + cos_t * fp.x - sin_t * fp.y;
+                        double wy = y + sin_t * fp.x + cos_t * fp.y;
+                        int wc = static_cast<int>((wx + half) / costmap_resolution_);
+                        int wr = static_cast<int>((wy + half) / costmap_resolution_);
+                        if (wc >= 0 && wc < grid_cells_ && wr >= 0 && wr < grid_cells_) {
+                            if (costmap->data[wr * grid_cells_ + wc] >= lethal) {
+                                fp_hit = true;
+                                break;
                             }
                         }
                     }
+                    if (fp_hit) { collision = true; break; }
 
-                    if (radius_collision) {
-                        collision = true;
-                        break;
-                    }
-
-                    // Clearance as inverse of terrain cost
-                    if (cell_cost >= 0) {
-                        double cl = 1.0 - static_cast<double>(cell_cost) / 100.0;
+                    // Terrain clearance
+                    if (cc_val >= 0) {
+                        double cl = 1.0 - static_cast<double>(cc_val) / 100.0;
                         min_clearance = std::min(min_clearance, cl);
                     }
                 }
 
                 if (collision) continue;
 
-                // === Scoring ===
-                // (a) Heading: alignment to pure pursuit target from trajectory end
-                double angle_to_goal = std::atan2(goal_local_y - y, goal_local_x - x);
-                double heading_err = std::abs(normalize_angle(angle_to_goal - theta));
-                double heading_score = 1.0 - heading_err / M_PI;
+                // ── Scoring [v3] ──
+
+                // (a) Heading: cosine-based (gentle for small errors)
+                double ang = std::atan2(goal_local_y - y, goal_local_x - x);
+                double herr = std::abs(normalize_angle(ang - theta));
+                double heading_score = (1.0 + std::cos(herr)) / 2.0;  // 1.0 at 0, 0.0 at π
 
                 // (b) Clearance
                 double clearance_score = (min_clearance < std::numeric_limits<double>::max())
                     ? min_clearance : 1.0;
 
-                // (c) Velocity: prefer forward motion
+                // (c) Velocity: strong forward preference
                 double velocity_score = 0.0;
                 if (max_lin_vel_ > 0.0) {
                     velocity_score = v / max_lin_vel_;
-                    // Slight penalty for pure reverse
-                    if (v < 0.0) velocity_score *= 0.5;
+                    if (v < 0.0) velocity_score *= 0.3;
                 }
 
-                // (d) Path distance: closeness to global A* path
+                // (d) Path distance
                 double path_dist_score = 1.0;
                 if (!global_path.empty()) {
-                    double min_dist = std::numeric_limits<double>::max();
+                    double min_d = std::numeric_limits<double>::max();
                     for (const auto &wp : global_path) {
                         double d = std::hypot(x - wp.first, y - wp.second);
-                        min_dist = std::min(min_dist, d);
+                        min_d = std::min(min_d, d);
                     }
-                    // Normalize: 0 at 1m distance, 1 at 0m
-                    path_dist_score = std::max(0.0, 1.0 - min_dist);
+                    path_dist_score = std::max(0.0, 1.0 - min_d);
+                }
+
+                // [v3] (e) Spin penalty: discourage v≈0 rotation when heading < 60°
+                double spin_penalty = 0.0;
+                if (abs_heading_err < spin_heading_threshold_) {
+                    if (std::abs(v) < 0.05 && std::abs(w) > 0.1) {
+                        spin_penalty = -0.5;
+                    }
                 }
 
                 double score = w_heading_ * heading_score
                              + w_clearance_ * clearance_score
                              + w_velocity_ * velocity_score
-                             + w_path_dist_ * path_dist_score;
+                             + w_path_dist_ * path_dist_score
+                             + spin_penalty;
 
                 if (score > best_score) {
                     best_score = score;
@@ -834,7 +795,6 @@ private:
             }
         }
 
-        // No valid trajectory found → emergency stop
         if (best_score <= -std::numeric_limits<double>::max() + 1.0) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                 "DWA: no valid trajectory — emergency stop");
@@ -882,113 +842,86 @@ private:
     // =====================================================================
     void publish_cmd(double v, double w)
     {
-        // ── 속도 스무딩 (지수 이동 평균) ──
-        // DWA가 매 사이클 다른 (v,w)를 선택해도 급격한 변화를 완화
-        const double alpha = 0.4;  // 0.0~1.0, 작을수록 부드러움
-        double smoothed_v = cur_v_ + alpha * (v - cur_v_);
-        double smoothed_w = cur_w_ + alpha * (w - cur_w_);
-
-        cur_v_ = smoothed_v;
-        cur_w_ = smoothed_w;
+        const double alpha = 0.4;
+        cur_v_ += alpha * (v - cur_v_);
+        cur_w_ += alpha * (w - cur_w_);
         geometry_msgs::msg::Twist cmd;
-        cmd.linear.x = smoothed_v;
-        cmd.angular.z = smoothed_w;
+        cmd.linear.x = cur_v_;
+        cmd.angular.z = cur_w_;
         pub_cmd_->publish(cmd);
     }
 
     void publish_stop()
     {
-        // 긴급 정지는 스무딩 없이 즉시 정지
         cur_v_ = 0.0;
         cur_w_ = 0.0;
         geometry_msgs::msg::Twist cmd;
-        cmd.linear.x = 0.0;
-        cmd.angular.z = 0.0;
         pub_cmd_->publish(cmd);
     }
 
-    // Publish cached odom-frame path directly (no per-cycle coordinate transform)
     void publish_global_path_odom(
-        const std::vector<std::pair<double, double>> &waypoints_odom,
+        const std::vector<std::pair<double, double>> &waypoints,
         const rclcpp::Time &stamp)
     {
         if (pub_global_path_->get_subscription_count() == 0) return;
-
-        nav_msgs::msg::Path path_msg;
-        path_msg.header.stamp = stamp;
-        path_msg.header.frame_id = odom_frame_;
-
-        for (const auto &[ox, oy] : waypoints_odom) {
+        nav_msgs::msg::Path msg;
+        msg.header.stamp = stamp;
+        msg.header.frame_id = odom_frame_;
+        for (const auto &[ox, oy] : waypoints) {
             geometry_msgs::msg::PoseStamped ps;
-            ps.header = path_msg.header;
+            ps.header = msg.header;
             ps.pose.position.x = ox;
             ps.pose.position.y = oy;
-            ps.pose.position.z = 0.0;
             ps.pose.orientation.w = 1.0;
-            path_msg.poses.push_back(ps);
+            msg.poses.push_back(ps);
         }
-
-        pub_global_path_->publish(path_msg);
+        pub_global_path_->publish(msg);
     }
 
     void publish_local_trajectory(
         const std::vector<std::pair<double, double>> &traj,
         const rclcpp::Time &stamp,
-        double robot_x, double robot_y, double robot_yaw)
+        double rx, double ry, double ryaw)
     {
-        if (pub_local_traj_->get_subscription_count() == 0) return;
-        if (traj.empty()) return;
-
-        nav_msgs::msg::Path traj_msg;
-        traj_msg.header.stamp = stamp;
-        traj_msg.header.frame_id = odom_frame_;
-
-        double cos_y = std::cos(robot_yaw);
-        double sin_y = std::sin(robot_yaw);
-
+        if (pub_local_traj_->get_subscription_count() == 0 || traj.empty()) return;
+        nav_msgs::msg::Path msg;
+        msg.header.stamp = stamp;
+        msg.header.frame_id = odom_frame_;
+        double cy = std::cos(ryaw), sy = std::sin(ryaw);
         for (const auto &[lx, ly] : traj) {
             geometry_msgs::msg::PoseStamped ps;
-            ps.header = traj_msg.header;
-            ps.pose.position.x = cos_y * lx - sin_y * ly + robot_x;
-            ps.pose.position.y = sin_y * lx + cos_y * ly + robot_y;
-            ps.pose.position.z = 0.0;
+            ps.header = msg.header;
+            ps.pose.position.x = cy * lx - sy * ly + rx;
+            ps.pose.position.y = sy * lx + cy * ly + ry;
             ps.pose.orientation.w = 1.0;
-            traj_msg.poses.push_back(ps);
+            msg.poses.push_back(ps);
         }
-
-        pub_local_traj_->publish(traj_msg);
+        pub_local_traj_->publish(msg);
     }
 
     // =====================================================================
     // Member variables
     // =====================================================================
-
-    // TF
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
-    // Subscribers
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr sub_costmap_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_goal_;
 
-    // Publishers
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_cmd_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_global_path_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_local_traj_;
 
-    // Timer
     rclcpp::TimerBase::SharedPtr control_timer_;
 
-    // State
     nav_msgs::msg::OccupancyGrid::ConstSharedPtr costmap_;
     std::mutex costmap_mutex_;
     geometry_msgs::msg::PoseStamped goal_;
     bool goal_active_ = false;
-    double cur_v_ = 0.0;  // current velocity (for dynamic window)
-    double cur_w_ = 0.0;
+    double cur_v_ = 0.0, cur_w_ = 0.0;
 
-    // === NEW: Path caching state ===
-    std::vector<std::pair<double, double>> cached_global_path_odom_;  // odom-frame cached path
+    // Path caching
+    std::vector<std::pair<double, double>> cached_global_path_odom_;
     rclcpp::Time last_replan_time_{0, 0, RCL_ROS_TIME};
     bool need_replan_ = true;
 
@@ -1002,33 +935,23 @@ private:
     double w_heading_, w_clearance_, w_velocity_, w_path_dist_;
     double goal_xy_tol_, goal_yaw_tol_;
     double astar_lethal_, astar_cost_weight_;
-    double robot_radius_, clearance_margin_;
+    double robot_length_, robot_width_;
+    double clearance_margin_;
     double control_rate_;
     std::string odom_frame_, robot_frame_;
     double slope_speed_factor_, slope_threshold_deg_;
-
-    // NEW: Path caching & Pure Pursuit parameters
-    double replan_interval_;
-    double path_deviation_threshold_;
-    double pure_pursuit_lookahead_;
-    double pure_pursuit_lookahead_min_;
-    double pure_pursuit_lookahead_max_;
+    double replan_interval_, path_deviation_threshold_;
+    double pure_pursuit_lookahead_, pure_pursuit_lookahead_min_, pure_pursuit_lookahead_max_;
     double velocity_lookahead_gain_;
+    double spin_heading_threshold_;
 };
 
-// =========================================================================
-// Main
 // =========================================================================
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<PathPlannerNode>();
-
-    // SIGINT(Ctrl+C) 시 on_shutdown 콜백으로 정지 명령 발행
-    rclcpp::on_shutdown([node]() {
-        node->send_stop_command();
-    });
-
+    rclcpp::on_shutdown([node]() { node->send_stop_command(); });
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
