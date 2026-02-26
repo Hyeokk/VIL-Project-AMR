@@ -157,6 +157,14 @@ IQ-9075 has a single Ethernet port (`end0`) shared by LiDAR, Camera, and (option
 | `192.168.30.0/24` | `192.168.30.100` | Camera (S10 Ultra) |
 | `10.6.4.0/24` | `10.6.4.1` | Host PC (SSH + DDS, wired only) |
 
+#### Check current config
+
+```bash
+sudo nano /etc/netplan/60-sensors.yaml
+```
+
+Review the current settings, then exit without changes: `Ctrl+X`
+
 #### WiFi only (no wired Host PC)
 
 ```bash
