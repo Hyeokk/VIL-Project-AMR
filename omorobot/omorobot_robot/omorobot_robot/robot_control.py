@@ -1,5 +1,6 @@
 import os
 import math
+import signal
 import rclpy
 from rclpy.node import Node
 from .packet_handler import *
@@ -72,6 +73,7 @@ class RobotControl(Node):
             self.tf_bc = TransformBroadcaster(self)
         self.timer_5ms = self.create_timer(0.005, self.update_encoder)
         self.timer_10ms = self.create_timer(0.01, self.update_robot)
+        self.timer_cmd = self.create_timer(0.02, self.update_cmd_vel)  # 50Hz 속도 스무딩
 
         self.ph.read_packet()
         self.enc_lh, self.enc_rh = None, None
@@ -83,13 +85,67 @@ class RobotControl(Node):
         self.time_pre = self.get_clock().now()
         self.wheel_lh_pos, self.wheel_rh_pos = 0.0, 0.0
 
+        # ── 속도 스무딩 & 안전 워치독 ──
+        self.target_v = 0.0         # cmd_vel에서 받은 목표 속도
+        self.target_w = 0.0
+        self.smooth_v = 0.0         # 실제 모터에 보내는 스무딩된 속도
+        self.smooth_w = 0.0
+        self.smooth_alpha = 0.3     # 스무딩 계수 (0.0~1.0, 작을수록 부드러움)
+        self.last_cmd_time = self.get_clock().now()
+        self.cmd_timeout = 0.3      # [수정] 0.5→0.3초: cmd_vel 없으면 즉시 정지
+
+        # 종료 플래그
+        self._shutting_down = False
+
     def print(self, str_info):
         self.get_logger().info(str_info)
 
     def cmd_vel_callback(self, msg):
         v = max(-self.motor_max_lin_vel, min(self.motor_max_lin_vel, msg.linear.x))
         w = max(-self.motor_max_ang_vel, min(self.motor_max_ang_vel, msg.angular.z))
-        self.ph.vw_command(v * 1000.0, w * 1000.0)
+        self.last_cmd_time = self.get_clock().now()
+        self.target_v = v
+        self.target_w = w
+
+    def update_cmd_vel(self):
+        """50Hz로 속도를 보간하여 모터에 전송 (스무딩 + 워치독)"""
+        # cmd_vel 워치독: 일정 시간 cmd_vel이 안 오면 즉시 정지
+        elapsed = (self.get_clock().now() - self.last_cmd_time).nanoseconds * 1e-9
+        if elapsed > self.cmd_timeout:
+            # [수정] EMA 스무딩 우회 — 즉시 정지
+            self.target_v = 0.0
+            self.target_w = 0.0
+            self.smooth_v = 0.0
+            self.smooth_w = 0.0
+            self.ph.vw_command(0.0, 0.0)
+            return
+
+        # 지수 이동 평균(EMA)으로 스무딩
+        self.smooth_v += self.smooth_alpha * (self.target_v - self.smooth_v)
+        self.smooth_w += self.smooth_alpha * (self.target_w - self.smooth_w)
+
+        # 아주 작은 값은 0으로 처리 (모터 떨림 방지)
+        if abs(self.smooth_v) < 0.005:
+            self.smooth_v = 0.0
+        if abs(self.smooth_w) < 0.005:
+            self.smooth_w = 0.0
+
+        self.ph.vw_command(self.smooth_v * 1000.0, self.smooth_w * 1000.0)
+
+    def emergency_stop(self):
+        """안전한 긴급 정지: 모터에 직접 정지 명령"""
+        self.print('Emergency stop: sending motor stop command')
+        self.target_v = 0.0
+        self.target_w = 0.0
+        self.smooth_v = 0.0
+        self.smooth_w = 0.0
+        try:
+            for _ in range(5):
+                self.ph.vw_command(0.0, 0.0)
+                import time
+                time.sleep(0.02)
+        except Exception:
+            pass
 
     def update_encoder(self):
         self.ph.read_packet()
@@ -182,19 +238,60 @@ class RobotControl(Node):
         pose.orientation.z = pose_yaw
         self.pub_pose.publish(pose)
 
+    def safe_shutdown(self):
+        """안전한 종료 처리: 모터 정지 → 타이머 해제 → 시리얼 닫기"""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+
+        self.print('Safe shutdown initiated')
+        # 1. 모터 즉시 정지 (가장 중요!)
+        self.emergency_stop()
+        # 2. 타이머 해제
+        try:
+            self.destroy_timer(self.timer_5ms)
+            self.destroy_timer(self.timer_10ms)
+            self.destroy_timer(self.timer_cmd)
+        except Exception:
+            pass
+        # 3. 시리얼 포트 닫기 (close_port 내에서도 정지 명령 전송)
+        try:
+            self.ph.close_port()
+        except Exception:
+            pass
+
+
 def main(args=None):
     rclpy.init(args=args)
     node = RobotControl()
+
+    # SIGINT(Ctrl+C), SIGTERM 시그널에 안전한 종료 처리 등록
+    def signal_handler(sig, frame):
+        node.safe_shutdown()
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     try:
         rclpy.spin(node)
-    except Exception as e:
-        node.get_logger().error(f'Exception occurred: {e}')
+    except (KeyboardInterrupt, Exception) as e:
+        if not isinstance(e, KeyboardInterrupt):
+            node.get_logger().error(f'Exception occurred: {e}')
     finally:
-        node.destroy_timer(node.timer_5ms)
-        node.destroy_timer(node.timer_10ms)
-        node.ph.close_port()
-        node.destroy_node()
-        rclpy.shutdown()
+        node.safe_shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':
