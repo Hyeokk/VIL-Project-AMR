@@ -3,6 +3,7 @@
 #
 # Costmap: 5m x 5m, 0.1m resolution = 50x50 cells
 # Robot: differential-drive (skid-steer), turn-in-place capable
+# [v2] 야외 풀밭 테스트 결과 반영: A* 지형 비용 과민 → 제자리 회전/우회 문제 수정
 
 path_planner_node:
   ros__parameters:
@@ -34,8 +35,10 @@ path_planner_node:
     goal_yaw_tolerance: 0.15    # [rad] ~8.6° heading tolerance
 
     # --- A* configuration ---
-    astar_lethal_cost: 80.0     # cells >= this value are impassable
-    astar_cost_weight: 2.0      # terrain cost penalty multiplier
+    # astar_lethal_cost: 80.0   # [v1] cells >= this value are impassable
+    astar_lethal_cost: 90.0     # [v2] lethal 판정을 더 보수적으로 (풀밭 셀이 lethal로 잡히는 것 방지)
+    # astar_cost_weight: 2.0    # [v1] terrain cost penalty multiplier
+    astar_cost_weight: 1.0      # [v2] 지형 비용 페널티 절반 → 직선 경로 선호
 
     # --- Robot footprint (rectangular, DONKEYBOTI actual size) ---
     robot_length: 1.432         # [m] front-to-back (x-axis)
@@ -59,11 +62,8 @@ path_planner_node:
     slope_threshold_deg: 15.0   # [deg] slope angle to trigger speed reduction
 
     # ============================================================
-    # --- NEW: Path Caching & Pure Pursuit (smooth motion) ---
+    # --- Path Caching & Pure Pursuit (smooth motion) ---
     # ============================================================
-    # A* 전역 경로를 매 사이클 재계산하지 않고 캐싱합니다.
-    # 이것이 "딸깍딸깍" 끊김 현상의 핵심 해결책입니다.
-    #
     replan_interval: 1.0              # [s] 주기적 A* 재계산 간격 (1초마다)
     path_deviation_threshold: 0.5     # [m] 로봇이 경로에서 이만큼 벗어나면 재계산
     pure_pursuit_lookahead: 0.4       # [m] Pure Pursuit 기본 lookahead 거리

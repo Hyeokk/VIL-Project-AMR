@@ -403,7 +403,12 @@ private:
     // =====================================================================
     void control_loop()
     {
-        if (!goal_active_) return;
+        // goal이 없으면 매 사이클 정지 명령을 계속 발행하여
+        // 확실한 정지 상태를 유지 (다음 goal_pose가 올 때까지)
+        if (!goal_active_) {
+            publish_stop();
+            return;
+        }
 
         // 1. Get latest costmap
         nav_msgs::msg::OccupancyGrid::ConstSharedPtr costmap;
