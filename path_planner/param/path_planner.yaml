@@ -42,7 +42,7 @@ path_planner_node:
     # --- A* configuration ---
     astar_lethal_cost: 90.0     # [v2] cells >= this are impassable
     # astar_cost_weight: 1.0    # [v2] original — too weak, A* hugged obstacles
-    astar_cost_weight: 2.5      # [v7] terrain cost penalty (↑ = prefer open space)
+    astar_cost_weight: 2.0      # [v7] terrain cost penalty (↑ = prefer open space)
 
     # --- Robot footprint (rectangular) ---
     # [v3] Replaced robot_radius with actual dimensions
@@ -56,7 +56,7 @@ path_planner_node:
     # -1 = auto (inscribed radius + clearance = 0.525m → 6 cells)
     # Increase if robot still clips obstacles on narrow passages
     # Decrease if robot can't find paths through wide-enough corridors
-    inflation_radius: -1.0      # [m] -1=auto, or set explicitly e.g. 0.6
+    inflation_radius: 0.4      # [m] -1=auto, or set explicitly e.g. 0.6
 
     # --- Control ---
     control_rate: 20.0          # [Hz]
