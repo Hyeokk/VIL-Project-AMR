@@ -106,6 +106,11 @@ public:
             "DWA weights: heading=%.2f, clearance=%.2f, velocity=%.2f, path=%.2f, spin_thresh=%.1f°",
             w_heading_, w_clearance_, w_velocity_, w_path_dist_,
             spin_heading_threshold_ * 180.0 / M_PI);
+        RCLCPP_INFO(get_logger(),
+            "[v7] A* inflation: radius=%.3fm (%d cells), astar_cost_weight=%.1f",
+            inflation_radius_,
+            static_cast<int>(std::ceil(inflation_radius_ / costmap_resolution_)),
+            astar_cost_weight_);
     }
 
     ~PathPlannerNode() override
@@ -188,6 +193,11 @@ private:
         declare_parameter<double>("recovery_reverse_vel", -0.15);  // [m/s] backup speed
         declare_parameter<double>("recovery_reverse_duration", 1.5); // [s] how long to back up
         declare_parameter<int>("recovery_max_attempts", 3);        // max recoveries per goal
+
+        // [v7] A* inflation — inflates obstacles by robot radius so A* keeps clearance
+        // Default = inscribed radius + clearance_margin = 0.525m
+        // Increase if robot still clips obstacles, decrease if corridors become impassable
+        declare_parameter<double>("inflation_radius", -1.0);  // [m] -1 = auto (inscribed + margin)
     }
 
     void load_parameters()
@@ -246,6 +256,13 @@ private:
         recovery_reverse_vel_ = get_parameter("recovery_reverse_vel").as_double();
         recovery_reverse_duration_ = get_parameter("recovery_reverse_duration").as_double();
         recovery_max_attempts_ = get_parameter("recovery_max_attempts").as_int();
+
+        // [v7] Inflation
+        inflation_radius_ = get_parameter("inflation_radius").as_double();
+        if (inflation_radius_ < 0.0) {
+            // Auto: use inscribed radius + clearance margin
+            inflation_radius_ = std::min(robot_length_, robot_width_) / 2.0 + clearance_margin_;
+        }
     }
 
     // =====================================================================
@@ -611,23 +628,118 @@ private:
     }
 
     // =====================================================================
-    // A* Global Planner
+    // A* Global Planner  [v7: inflation-aware]
+    //
+    // Before planning, inflates the costmap by the robot's inscribed
+    // radius so that A* paths maintain sufficient clearance for DWA.
     // =====================================================================
+
+    // Build inflated cost grid from raw costmap
+    // Two-zone inflation:
+    //   Inner zone (0 ~ inscribed radius): lethal → A* hard-blocks
+    //   Outer zone (inscribed ~ inflation_radius): decaying cost → A* avoids
+    std::vector<int> inflate_costmap(
+        const nav_msgs::msg::OccupancyGrid::ConstSharedPtr &costmap)
+    {
+        const int rows = costmap->info.height;
+        const int cols = costmap->info.width;
+        const auto &data = costmap->data;
+        const int lethal = static_cast<int>(astar_lethal_);
+
+        // Inner zone: inscribed radius (hard lethal)
+        double inscribed_r = std::min(robot_length_, robot_width_) / 2.0;
+        int inner_r = static_cast<int>(std::ceil(inscribed_r / costmap_resolution_));
+
+        // Outer zone: inflation_radius_ (decaying cost)
+        int outer_r = static_cast<int>(std::ceil(inflation_radius_ / costmap_resolution_));
+
+        // Start with original costs
+        std::vector<int> inflated(rows * cols);
+        for (int i = 0; i < rows * cols; ++i) {
+            inflated[i] = data[i];
+        }
+
+        // For each lethal cell, inflate surrounding cells
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                int raw = data[r * cols + c];
+                if (raw < lethal) continue;  // only inflate from lethal cells
+
+                for (int dr = -outer_r; dr <= outer_r; ++dr) {
+                    for (int dc = -outer_r; dc <= outer_r; ++dc) {
+                        int nr = r + dr, nc = c + dc;
+                        if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
+
+                        double dist_cells = std::hypot(dr, dc);
+                        if (dist_cells > outer_r) continue;
+
+                        int inflated_cost;
+                        if (dist_cells <= inner_r) {
+                            // Inner zone: hard lethal — A* cannot pass here
+                            inflated_cost = lethal;
+                        } else {
+                            // Outer zone: linear decay from lethal-1 to lethal/2
+                            double t = (dist_cells - inner_r) / std::max(1.0, (double)(outer_r - inner_r));
+                            inflated_cost = static_cast<int>(lethal * (0.95 - 0.45 * t));
+                            // clamp: at inner_r boundary ~85, at outer_r boundary ~45
+                        }
+
+                        int idx = nr * cols + nc;
+                        inflated[idx] = std::max(inflated[idx], inflated_cost);
+                    }
+                }
+            }
+        }
+
+        return inflated;
+    }
+
+    // Find nearest free cell in the inflated grid (for goal relocation)
+    Cell find_nearest_free_inflated(
+        const std::vector<int> &inflated, int rows, int cols,
+        const Cell &target)
+    {
+        const int lethal = static_cast<int>(astar_lethal_);
+        for (int rad = 1; rad < std::max(rows, cols) / 2; ++rad) {
+            for (int dr = -rad; dr <= rad; ++dr) {
+                for (int dc = -rad; dc <= rad; ++dc) {
+                    if (std::abs(dr) != rad && std::abs(dc) != rad) continue;
+                    int nr = target.r + dr, nc = target.c + dc;
+                    if (nr >= 0 && nr < rows && nc >= 0 && nc < cols) {
+                        int c = inflated[nr * cols + nc];
+                        if (c >= 0 && c < lethal)
+                            return {nr, nc};
+                    }
+                }
+            }
+        }
+        return {-1, -1};
+    }
+
     std::vector<Cell> astar_plan(
         const nav_msgs::msg::OccupancyGrid::ConstSharedPtr &costmap,
         Cell start, Cell goal)
     {
         const int rows = costmap->info.height;
         const int cols = costmap->info.width;
-        const auto &data = costmap->data;
+        const int lethal = static_cast<int>(astar_lethal_);
+
+        // Inflate costmap for footprint-aware planning
+        auto inflated = inflate_costmap(costmap);
 
         auto get_cost = [&](int r, int c) -> int {
             if (r < 0 || r >= rows || c < 0 || c >= cols) return 127;
-            return data[r * cols + c];
+            return inflated[r * cols + c];
         };
 
-        if (get_cost(goal.r, goal.c) >= static_cast<int>(astar_lethal_)) {
-            goal = find_nearest_free(costmap, goal);
+        // Start cell: robot is already here, force-clear even if inflated
+        // (otherwise A* can't start when robot is near an obstacle)
+        if (get_cost(start.r, start.c) >= lethal) {
+            inflated[start.r * cols + start.c] = lethal - 1;
+        }
+
+        if (get_cost(goal.r, goal.c) >= lethal) {
+            goal = find_nearest_free_inflated(inflated, rows, cols, goal);
             if (goal.r < 0) return {};
         }
 
@@ -661,7 +773,7 @@ private:
                 if (nb.r < 0 || nb.r >= rows || nb.c < 0 || nb.c >= cols) continue;
 
                 int cc = get_cost(nb.r, nb.c);
-                if (cc < 0 || cc >= static_cast<int>(astar_lethal_)) continue;
+                if (cc < 0 || cc >= lethal) continue;
 
                 double penalty = static_cast<double>(cc) / 100.0 * astar_cost_weight_;
                 double tentative = g_score[current] + move_cost[i] * (1.0 + penalty);
@@ -1078,6 +1190,9 @@ private:
     double recovery_reverse_vel_;
     double recovery_reverse_duration_;
     int recovery_max_attempts_;
+
+    // [v7] Inflation
+    double inflation_radius_;
 };
 
 // =========================================================================
