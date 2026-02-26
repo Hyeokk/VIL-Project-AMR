@@ -16,5 +16,5 @@ cloud_merger:
     # Example: max_height_from_ground=2.0, sensor_height=0.63
     #          → body frame z > 1.37m gets removed
     enable_height_filter: true
-    max_height_from_ground: 2.0   # [m] 지면에서 이 높이 초과 점 제거
+    max_height_from_ground: 1.0   # [m] 지면에서 이 높이 초과 점 제거
     sensor_height: 0.63           # [m] 센서(body frame)의 지면 위 높이
