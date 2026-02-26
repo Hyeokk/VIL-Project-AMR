@@ -1,5 +1,5 @@
 # path_planner parameters for DONKEYBOTI caterpillar robot
-# A* global planner + DWA local planner
+# A* global planner + Pure Pursuit + DWA local planner
 #
 # Costmap: 5m x 5m, 0.1m resolution = 50x50 cells
 # Robot: differential-drive (skid-steer), turn-in-place capable
@@ -43,7 +43,7 @@ path_planner_node:
     clearance_margin: 0.1       # [m] extra safety buffer around footprint
 
     # --- Control ---
-    control_rate: 10.0          # [Hz] control loop frequency
+    control_rate: 20.0          # [Hz] control loop frequency (20Hz for smooth motion)
 
     # --- Frames ---
     odom_frame: "odom"
@@ -57,3 +57,16 @@ path_planner_node:
     # --- Slope speed reduction (future: IMU integration) ---
     slope_speed_factor: 0.5     # reduce max_v by this factor on slopes
     slope_threshold_deg: 15.0   # [deg] slope angle to trigger speed reduction
+
+    # ============================================================
+    # --- NEW: Path Caching & Pure Pursuit (smooth motion) ---
+    # ============================================================
+    # A* 전역 경로를 매 사이클 재계산하지 않고 캐싱합니다.
+    # 이것이 "딸깍딸깍" 끊김 현상의 핵심 해결책입니다.
+    #
+    replan_interval: 1.0              # [s] 주기적 A* 재계산 간격 (1초마다)
+    path_deviation_threshold: 0.5     # [m] 로봇이 경로에서 이만큼 벗어나면 재계산
+    pure_pursuit_lookahead: 0.4       # [m] Pure Pursuit 기본 lookahead 거리
+    pure_pursuit_lookahead_min: 0.2   # [m] 최소 lookahead (저속 시)
+    pure_pursuit_lookahead_max: 0.8   # [m] 최대 lookahead (고속 시)
+    velocity_lookahead_gain: 0.5      # lookahead = base + gain * |v|
