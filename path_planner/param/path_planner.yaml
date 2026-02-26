@@ -50,7 +50,7 @@ path_planner_node:
     robot_frame: "base_link"
 
     # --- Topics ---
-    costmap_topic: "/terrain_costmap"
+    costmap_topic: "/semantic_merger_node/semantic_costmap"
     goal_topic: "/goal_pose"
     cmd_vel_topic: "/cmd_vel"
 

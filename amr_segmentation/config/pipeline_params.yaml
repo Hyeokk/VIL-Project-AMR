@@ -1,0 +1,31 @@
+# =============================================================================
+# amr_segmentation pipeline parameters
+# =============================================================================
+
+segmentation_node:
+  ros__parameters:
+    model_path: "~/models/ddrnet23_slim_unified7class_544x640_nearest.onnx"
+    use_qnn: true
+    image_topic: "/lx_camera_node/LxCamera_Rgb"
+    publish_visualization: true
+
+pointcloud_painter_node:
+  ros__parameters:
+    lidar_topic: "/cloud_registered_body"
+    seg_topic: "/segmentation_node/segmentation"
+    caminfo_topic: "/lx_camera_node/LxCamera_RgbInfo"
+    camera_frame: "mrdvs_rgb"
+    enable_geometric_fallback: true
+    tf_timeout_sec: 1.0
+
+semantic_merger_node:
+  ros__parameters:
+    painted_topic: "/pointcloud_painter_node/painted_pointcloud"
+    s10_cloud_topic: "/lx_camera_node/LxCamera_Cloud"
+    seg_topic: "/segmentation_node/segmentation"
+    caminfo_topic: "/lx_camera_node/LxCamera_RgbInfo"
+    robot_frame: "body"
+    grid_size_m: 6.0
+    resolution: 0.1
+    z_min: -1.0
+    z_max: 2.0
