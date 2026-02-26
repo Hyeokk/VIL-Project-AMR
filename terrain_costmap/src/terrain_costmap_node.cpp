@@ -1,5 +1,5 @@
 // terrain_costmap_node.cpp
-// Generates a 3m×3m robot-centric costmap from GroundGrid output.
+// Generates a 5m×5m robot-centric costmap from GroundGrid output.
 //
 // Inputs:
 //   /groundgrid/grid_map      (grid_map_msgs/GridMap)  — elevation, variance, confidence
@@ -7,7 +7,7 @@
 //   TF: odom → base_link chain
 //
 // Outputs:
-//   /terrain_costmap           (nav_msgs/OccupancyGrid) — 3m×3m traversability costmap
+//   /terrain_costmap           (nav_msgs/OccupancyGrid) — 5m×5m traversability costmap
 //   /terrain_costmap/terrain_cloud (PointCloud2)        — accumulated terrain for debug
 //
 // Cost factors:
@@ -16,12 +16,15 @@
 //   3. Roughness          — height variance within cell
 //   4. Uncertainty        — low groundpatch confidence = unknown area
 //
+// [v3] Dynamic obstacle support:
+//   Obstacle observations are tracked in odom-frame persistent grid with timestamps.
+//   When GroundGrid reports ground in a cell, obstacle history is cleared immediately.
+//   Obstacle costs decay over time (configurable half-life) so that
+//   dynamic obstacles (people, animals) don't leave permanent traces.
+//
 // Persistent terrain map:
 //   Ground points are accumulated in odom frame over time (sliding window)
 //   to fill sensor blind spots as the robot moves.
-//   When a costmap cell has no GroundGrid data (unknown), the accumulated
-//   terrain points are used as fallback to compute slope and roughness.
-//   This preserves previously observed terrain behind and beside the robot.
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
@@ -46,6 +49,7 @@
 #include <mutex>
 #include <cmath>
 #include <algorithm>
+#include <unordered_map>
 
 // Per-cell statistics from accumulated terrain points (odom frame → robot frame)
 struct TerrainCellStats {
@@ -58,6 +62,27 @@ struct TerrainCellStats {
         if (count < 2) return 0.0;
         double m = mean_z();
         return std::max(0.0, sum_z2 / count - m * m);
+    }
+};
+
+// =========================================================================
+// [v3] NEW: Persistent obstacle tracking cell (odom frame)
+// =========================================================================
+struct ObstacleCell {
+    double obstacle_score = 0.0;     // 누적 장애물 점수 [0, 1]
+    double last_observed_sec = 0.0;  // 마지막 장애물 관측 시각 (초)
+    double last_cleared_sec = 0.0;   // 마지막으로 ground로 확인된 시각 (초)
+};
+
+// Hash for odom-frame grid cell (discretized by resolution)
+struct OdomCellKey {
+    int gx, gy;
+    bool operator==(const OdomCellKey &o) const { return gx == o.gx && gy == o.gy; }
+};
+
+struct OdomCellHash {
+    size_t operator()(const OdomCellKey &k) const {
+        return std::hash<int>()(k.gx) ^ (std::hash<int>()(k.gy) << 16);
     }
 };
 
@@ -84,6 +109,11 @@ public:
         RCLCPP_INFO(get_logger(),
             "Weights: obstacle=%.2f, slope=%.2f, roughness=%.2f, unknown=%.2f",
             w_obstacle_, w_slope_, w_roughness_, w_unknown_);
+        // [v3]
+        RCLCPP_INFO(get_logger(),
+            "Dynamic obstacle: decay_time=%.1fs, clear_on_ground=%s",
+            obstacle_decay_time_,
+            obstacle_clear_on_ground_ ? "true" : "false");
     }
 
 private:
@@ -124,6 +154,11 @@ private:
         this->declare_parameter<std::string>("filtered_cloud_topic", "/groundgrid/filtered_cloud");
         this->declare_parameter<std::string>("costmap_topic", "/terrain_costmap");
         this->declare_parameter<std::string>("terrain_cloud_topic", "/terrain_costmap/terrain_cloud");
+
+        // === [v3] NEW: Dynamic obstacle parameters ===
+        this->declare_parameter<double>("obstacle_decay_time", 2.0);       // [s] 장애물 비용 완전 소멸 시간
+        this->declare_parameter<bool>("obstacle_clear_on_ground", true);   // ground 관측 시 즉시 클리어
+        this->declare_parameter<double>("obstacle_grid_radius", 8.0);      // [m] odom 장애물 그리드 유지 반경
     }
 
     void load_parameters()
@@ -154,6 +189,11 @@ private:
         filtered_cloud_topic_ = get_parameter("filtered_cloud_topic").as_string();
         costmap_topic_ = get_parameter("costmap_topic").as_string();
         terrain_cloud_topic_ = get_parameter("terrain_cloud_topic").as_string();
+
+        // [v3]
+        obstacle_decay_time_ = get_parameter("obstacle_decay_time").as_double();
+        obstacle_clear_on_ground_ = get_parameter("obstacle_clear_on_ground").as_bool();
+        obstacle_grid_radius_ = get_parameter("obstacle_grid_radius").as_double();
     }
 
     // =========================================================================
@@ -192,6 +232,158 @@ private:
                 terrain_timer_ = create_wall_timer(
                     std::chrono::duration<double>(1.0 / rate),
                     std::bind(&TerrainCostmapNode::publish_terrain_cloud, this));
+            }
+        }
+    }
+
+    // =========================================================================
+    // [v3] Odom-frame coordinate → grid key conversion
+    // =========================================================================
+    OdomCellKey odom_to_key(double ox, double oy) const
+    {
+        return {
+            static_cast<int>(std::floor(ox / costmap_resolution_)),
+            static_cast<int>(std::floor(oy / costmap_resolution_))
+        };
+    }
+
+    // =========================================================================
+    // [v3] Query decayed obstacle cost for an odom-frame position
+    // =========================================================================
+    double get_decayed_obstacle_cost(double ox, double oy, double now_sec) const
+    {
+        auto key = odom_to_key(ox, oy);
+        std::lock_guard<std::mutex> lock(obstacle_grid_mutex_);
+        auto it = obstacle_grid_.find(key);
+        if (it == obstacle_grid_.end())
+            return 0.0;
+
+        const auto &cell = it->second;
+
+        // ground로 클리어된 셀은 비용 0
+        if (cell.last_cleared_sec > cell.last_observed_sec)
+            return 0.0;
+
+        // 시간 기반 선형 감쇠: elapsed가 decay_time 이상이면 완전 소멸
+        double elapsed = now_sec - cell.last_observed_sec;
+        if (elapsed >= obstacle_decay_time_)
+            return 0.0;
+
+        double decay_factor = 1.0 - (elapsed / obstacle_decay_time_);
+        return cell.obstacle_score * decay_factor;
+    }
+
+    // =========================================================================
+    // [v3] Update obstacle grid from filtered cloud (obstacle + ground)
+    // =========================================================================
+    void update_obstacle_grid(
+        const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg,
+        const geometry_msgs::msg::TransformStamped &tf_to_odom)
+    {
+        const auto &fields = msg->fields;
+        int intensity_offset = -1;
+        for (const auto &f : fields) {
+            if (f.name == "intensity") {
+                intensity_offset = f.offset;
+                break;
+            }
+        }
+        if (intensity_offset < 0) return;
+
+        const float tx = tf_to_odom.transform.translation.x;
+        const float ty = tf_to_odom.transform.translation.y;
+        const float tz = tf_to_odom.transform.translation.z;
+
+        tf2::Quaternion q;
+        tf2::fromMsg(tf_to_odom.transform.rotation, q);
+        tf2::Matrix3x3 rot(q);
+
+        const double now_sec = rclcpp::Time(msg->header.stamp).seconds();
+        const uint8_t *data = msg->data.data();
+        const size_t step = msg->point_step;
+        const int x_off = msg->fields[0].offset;
+        const int y_off = msg->fields[1].offset;
+        const int z_off = msg->fields[2].offset;
+
+        // 셀별 프레임 내 카운트 (obstacle / ground)
+        struct FrameCount { int obs = 0; int gnd = 0; };
+        std::unordered_map<OdomCellKey, FrameCount, OdomCellHash> frame_counts;
+
+        for (size_t i = 0; i < msg->width * msg->height; ++i) {
+            const float intensity = *reinterpret_cast<const float *>(
+                data + i * step + intensity_offset);
+
+            const float px = *reinterpret_cast<const float *>(data + i * step + x_off);
+            const float py = *reinterpret_cast<const float *>(data + i * step + y_off);
+            const float pz = *reinterpret_cast<const float *>(data + i * step + z_off);
+
+            if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz))
+                continue;
+
+            // Transform to odom frame
+            double ox = rot[0][0]*px + rot[0][1]*py + rot[0][2]*pz + tx;
+            double oy = rot[1][0]*px + rot[1][1]*py + rot[1][2]*pz + ty;
+
+            auto key = odom_to_key(ox, oy);
+
+            bool is_obstacle = (std::abs(intensity - 99.0f) < 5.0f);
+            bool is_ground = (std::abs(intensity - 49.0f) < 5.0f);
+
+            if (is_obstacle) {
+                frame_counts[key].obs++;
+            } else if (is_ground) {
+                frame_counts[key].gnd++;
+            }
+        }
+
+        // 장애물 그리드 업데이트
+        std::lock_guard<std::mutex> lock(obstacle_grid_mutex_);
+        for (const auto &[key, cnt] : frame_counts) {
+            auto &cell = obstacle_grid_[key];
+
+            if (cnt.obs > 0) {
+                // 장애물 관측: 점수 업데이트
+                double new_score = std::min(
+                    static_cast<double>(cnt.obs) / obstacle_count_max_, 1.0);
+                // 기존 값과 새 값 중 큰 쪽 유지 (한 프레임 내)
+                cell.obstacle_score = std::max(cell.obstacle_score, new_score);
+                cell.last_observed_sec = now_sec;
+            }
+
+            if (obstacle_clear_on_ground_ && cnt.gnd > 0 && cnt.obs == 0) {
+                // 이 프레임에서 ground만 관측 → 장애물 즉시 클리어
+                cell.last_cleared_sec = now_sec;
+            }
+        }
+
+        // 오래된 셀 정리 (로봇 위치 기준 반경 밖 + 완전 감쇠된 셀)
+        prune_obstacle_grid(tx, ty, now_sec);
+    }
+
+    // =========================================================================
+    // [v3] Prune old obstacle grid entries
+    // =========================================================================
+    void prune_obstacle_grid(double robot_x, double robot_y, double now_sec)
+    {
+        // 이미 lock 상태 (caller에서 잡음)
+        const double r2 = obstacle_grid_radius_ * obstacle_grid_radius_;
+
+        for (auto it = obstacle_grid_.begin(); it != obstacle_grid_.end(); ) {
+            double cx = (it->first.gx + 0.5) * costmap_resolution_;
+            double cy = (it->first.gy + 0.5) * costmap_resolution_;
+            double dx = cx - robot_x;
+            double dy = cy - robot_y;
+            double dist2 = dx * dx + dy * dy;
+
+            // 반경 밖이거나 완전히 감쇠된 셀 제거
+            bool expired = (now_sec - it->second.last_observed_sec) >= obstacle_decay_time_;
+            bool cleared = (it->second.last_cleared_sec > it->second.last_observed_sec);
+            bool out_of_range = dist2 > r2;
+
+            if (out_of_range || (expired && cleared)) {
+                it = obstacle_grid_.erase(it);
+            } else {
+                ++it;
             }
         }
     }
@@ -278,7 +470,6 @@ private:
         costmap->info.height = costmap_cells_;
 
         // Origin: bottom-left corner of the costmap in robot frame
-        // Robot is at center of costmap, so origin is at (-size/2, -size/2)
         costmap->info.origin.position.x = -costmap_size_ / 2.0;
         costmap->info.origin.position.y = -costmap_size_ / 2.0;
         costmap->info.origin.position.z = 0.0;
@@ -306,6 +497,9 @@ private:
         // Get robot position for coordinate mapping
         const grid_map::Position submap_center = submap.getPosition();
         const float submap_res = submap.getResolution();
+
+        // [v3] 현재 시각 (감쇠 계산용)
+        const double now_sec = rclcpp::Time(tf_odom_to_robot.header.stamp).seconds();
 
         // Iterate over costmap cells
         for (int cy = 0; cy < costmap_cells_; ++cy) {
@@ -335,12 +529,24 @@ private:
                 grid_map::Index idx;
                 submap.getIndex(query_pos, idx);
 
-                // (a) Obstacle density
+                // (a) Obstacle density — [v3] from GroundGrid (instantaneous)
+                // [v1] 원본: GroundGrid의 현재 프레임 obstacle만 사용
+                // double instantaneous_obstacle = 0.0;
+                // if (has_points) {
+                //     float pt_count = submap.at("points", idx);
+                //     instantaneous_obstacle = std::min(
+                //         static_cast<double>(pt_count) / obstacle_count_max_, 1.0);
+                // }
+                //
+                // [v3] 변경: 현재 프레임 + odom 기반 감쇠 장애물 중 큰 값 사용
+                double instantaneous_obstacle = 0.0;
                 if (has_points) {
                     float pt_count = submap.at("points", idx);
-                    obstacle_cost = std::min(
+                    instantaneous_obstacle = std::min(
                         static_cast<double>(pt_count) / obstacle_count_max_, 1.0);
                 }
+                double decayed_obstacle = get_decayed_obstacle_cost(ox, oy, now_sec);
+                obstacle_cost = std::max(instantaneous_obstacle, decayed_obstacle);
 
                 // (b) Slope from elevation gradient
                 if (has_ground) {
@@ -457,9 +663,6 @@ private:
     // =========================================================================
     // Terrain grid from accumulated points (for unknown-cell fallback)
     // =========================================================================
-
-    // Build a costmap-sized grid by binning terrain_cloud_ (odom frame)
-    // into robot-frame costmap cells.
     std::vector<TerrainCellStats> build_terrain_grid(
         const geometry_msgs::msg::TransformStamped &tf_odom_to_robot)
     {
@@ -469,9 +672,6 @@ private:
         if (!terrain_cloud_ || terrain_cloud_->empty())
             return grid;
 
-        // tf_odom_to_robot = lookupTransform(odom, robot)
-        // This gives robot position/orientation in odom frame.
-        // To convert odom→robot: p_robot = R^T * (p_odom - t)
         const double tx = tf_odom_to_robot.transform.translation.x;
         const double ty = tf_odom_to_robot.transform.translation.y;
         const double half = costmap_size_ / 2.0;
@@ -532,6 +732,7 @@ private:
 
     // =========================================================================
     // Filtered cloud callback — Persistent terrain accumulation
+    //                         + [v3] Dynamic obstacle tracking
     // =========================================================================
     void filtered_cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
     {
@@ -551,8 +752,10 @@ private:
             return;
         }
 
-        // Parse intensity to separate ground/obstacle
-        // GroundGrid visualize mode: ground=49, obstacle=99
+        // [v3] 장애물 그리드 업데이트 (obstacle + ground 포인트 모두 활용)
+        update_obstacle_grid(msg, tf_to_odom);
+
+        // === 기존 terrain accumulation (ground 포인트만) ===
         const auto &fields = msg->fields;
         int intensity_offset = -1;
         for (const auto &f : fields) {
@@ -681,6 +884,10 @@ private:
     pcl::PointCloud<pcl::PointXYZI>::Ptr terrain_cloud_;
     std::mutex terrain_mutex_;
 
+    // [v3] Dynamic obstacle tracking (odom frame)
+    std::unordered_map<OdomCellKey, ObstacleCell, OdomCellHash> obstacle_grid_;
+    mutable std::mutex obstacle_grid_mutex_;
+
     // Cached yaw (updated each frame)
     double cos_yaw_ = 1.0;
     double sin_yaw_ = 0.0;
@@ -706,6 +913,11 @@ private:
     bool enable_terrain_accum_;
     int terrain_max_points_;
     double terrain_radius_;
+
+    // [v3] Dynamic obstacle parameters
+    double obstacle_decay_time_;
+    bool obstacle_clear_on_ground_;
+    double obstacle_grid_radius_;
 
     std::string gridmap_topic_;
     std::string filtered_cloud_topic_;

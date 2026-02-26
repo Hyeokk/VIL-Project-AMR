@@ -1,8 +1,9 @@
 # terrain_costmap parameters for DONKEYBOTI AMR
 # Mountain terrain, caterpillar (skid-steer) robot
 #
-# Costmap: 3m x 3m, 0.1m resolution = 30x30 cells (900 cells)
+# Costmap: 5m x 5m, 0.1m resolution = 50x50 cells
 # Updated at GroundGrid rate (~10Hz)
+# [v2] 야외 풀밭 테스트 결과 반영: slope/roughness 과민 → 제자리 회전/우회 문제 수정
 
 terrain_costmap_node:
   ros__parameters:
@@ -13,28 +14,39 @@ terrain_costmap_node:
     odom_frame: "odom"
 
     # --- Cost weights ---
-    # Sum = 1.0 for normalized output, but not strictly required.
-    # Caterpillar robot: slope tolerance is higher, obstacle avoidance is top priority.
-    weight_obstacle: 0.40      # Non-ground point density
-    weight_slope: 0.30         # Terrain inclination
-    weight_roughness: 0.15     # Surface irregularity
-    weight_unknown: 0.15       # Unobserved / low-confidence area
+    # [v1] obstacle=0.40, slope=0.30, roughness=0.15, unknown=0.15
+    # [v2] 장애물 비중 ↑, 지형 비중 ↓ → 풀밭에서 불필요한 우회 방지
+    # weight_obstacle: 0.40    # [v1]
+    weight_obstacle: 0.60      # [v2] 실제 장애물을 최우선으로 반영
+    # weight_slope: 0.30       # [v1]
+    weight_slope: 0.15         # [v2] 경사 비용 절반 축소 (궤도차량은 경사 강함)
+    # weight_roughness: 0.15   # [v1]
+    weight_roughness: 0.10     # [v2] 표면 거칠기 비용 축소 (풀밭 자연 분산 허용)
+    weight_unknown: 0.15       # 유지
 
     # --- Thresholds ---
-    # Caterpillar can handle steeper slopes than wheeled robots (~35°)
-    slope_max_deg: 35.0        # [deg] slopes >= this → cost 1.0
-    roughness_max: 0.05        # [m²] variance >= this → cost 1.0
-    obstacle_count_max: 5.0    # obstacle points >= this → cost 1.0
-    confidence_threshold: 0.1  # groundpatch confidence below this → "unknown"
+    slope_max_deg: 35.0        # [deg] slopes >= this → cost 1.0 (유지)
+    # roughness_max: 0.05      # [v1] [m²] variance >= this → cost 1.0
+    roughness_max: 0.15        # [v2] 풀밭의 자연 높이 분산(~10cm)을 허용
+    # obstacle_count_max: 5.0  # [v1]
+    obstacle_count_max: 8.0    # [v2] 풀에서 반사된 소수 포인트를 무시
+    # confidence_threshold: 0.1   # [v1]
+    confidence_threshold: 0.05    # [v2] 더 낮은 confidence도 관측된 것으로 인정
 
-    # Cells with total cost >= lethal_threshold are set to 100 (impassable)
-    lethal_threshold: 0.8
+    # lethal_threshold: 0.8    # [v1]
+    lethal_threshold: 0.85     # [v2] lethal 판정 기준 약간 완화
 
     # --- Persistent terrain accumulation ---
     enable_terrain_accumulation: true
     terrain_max_points: 200000   # Max accumulated ground points in memory
     terrain_radius: 10.0         # [m] Sliding window radius around robot
     terrain_publish_rate: 1.0    # [Hz] Terrain cloud publish rate (debug/viz)
+
+    # === [v3] NEW: Dynamic obstacle decay ===
+    # 사람 등 동적 장애물이 사라진 후 costmap에 잔상이 남는 문제 해결
+    obstacle_decay_time: 2.0           # [s] 장애물 관측 중단 후 비용이 0으로 감쇠되는 시간
+    obstacle_clear_on_ground: true     # ground 포인트가 관측되면 즉시 장애물 클리어
+    obstacle_grid_radius: 8.0          # [m] odom 프레임 장애물 그리드 유지 반경
 
     # --- Topics ---
     gridmap_topic: "/groundgrid/grid_map"
