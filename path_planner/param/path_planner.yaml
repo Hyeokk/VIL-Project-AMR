@@ -78,3 +78,11 @@ path_planner_node:
     # When heading error to goal < this threshold, penalize pure rotation (v≈0, |w|>0)
     # Forces robot to drive forward while turning instead of spinning in place
     spin_heading_threshold: 1.05      # [rad] ~60°
+
+    # --- [v6] Recovery behavior ---
+    # When DWA fails N consecutive times, robot backs up and replans
+    recovery_enabled: true
+    recovery_fail_count: 5            # consecutive DWA failures to trigger recovery
+    recovery_reverse_vel: -0.15       # [m/s] backup speed (negative = reverse)
+    recovery_reverse_duration: 1.5    # [s] how long to back up
+    recovery_max_attempts: 3          # max recoveries per goal (then give up)

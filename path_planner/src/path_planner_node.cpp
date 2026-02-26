@@ -181,6 +181,13 @@ private:
 
         // [v3]
         declare_parameter<double>("spin_heading_threshold", 1.05);
+
+        // [v6] Recovery behavior
+        declare_parameter<bool>("recovery_enabled", true);
+        declare_parameter<int>("recovery_fail_count", 5);          // consecutive DWA fails to trigger
+        declare_parameter<double>("recovery_reverse_vel", -0.15);  // [m/s] backup speed
+        declare_parameter<double>("recovery_reverse_duration", 1.5); // [s] how long to back up
+        declare_parameter<int>("recovery_max_attempts", 3);        // max recoveries per goal
     }
 
     void load_parameters()
@@ -232,6 +239,13 @@ private:
         velocity_lookahead_gain_ = get_parameter("velocity_lookahead_gain").as_double();
 
         spin_heading_threshold_ = get_parameter("spin_heading_threshold").as_double();
+
+        // [v6] Recovery
+        recovery_enabled_ = get_parameter("recovery_enabled").as_bool();
+        recovery_fail_count_ = get_parameter("recovery_fail_count").as_int();
+        recovery_reverse_vel_ = get_parameter("recovery_reverse_vel").as_double();
+        recovery_reverse_duration_ = get_parameter("recovery_reverse_duration").as_double();
+        recovery_max_attempts_ = get_parameter("recovery_max_attempts").as_int();
     }
 
     // =====================================================================
@@ -333,6 +347,11 @@ private:
         goal_active_ = true;
         need_replan_ = true;
 
+        // [v6] Reset recovery state for new goal
+        consecutive_fails_ = 0;
+        recovery_active_ = false;
+        recovery_attempts_ = 0;
+
         RCLCPP_INFO(get_logger(),
             "New goal: (%.2f, %.2f) in odom [source: '%s']",
             goal_odom.pose.position.x, goal_odom.pose.position.y,
@@ -424,6 +443,29 @@ private:
             return;
         }
 
+        // ── [v6] Recovery: handle active backup FIRST ──
+        if (recovery_active_) {
+            double elapsed = (get_clock()->now() - recovery_start_time_).seconds();
+            if (elapsed < recovery_reverse_duration_) {
+                // Still backing up — publish reverse directly (bypass smoothing)
+                geometry_msgs::msg::Twist cmd;
+                cmd.linear.x = recovery_reverse_vel_;
+                cmd.angular.z = 0.0;
+                pub_cmd_->publish(cmd);
+                cur_v_ = recovery_reverse_vel_;
+                cur_w_ = 0.0;
+                return;
+            } else {
+                // Backup done → force replan
+                recovery_active_ = false;
+                consecutive_fails_ = 0;
+                need_replan_ = true;
+                cached_global_path_odom_.clear();
+                RCLCPP_INFO(get_logger(), "Recovery complete — replanning");
+                // Fall through to normal planning
+            }
+        }
+
         // 1. Costmap
         nav_msgs::msg::OccupancyGrid::ConstSharedPtr costmap;
         {
@@ -447,11 +489,12 @@ private:
         double dy = goal_y - robot_y;
         double dist = std::hypot(dx, dy);
 
-        // 4. Goal reached? — position only, no yaw alignment
+        // 4. Goal reached?
         if (dist < goal_xy_tol_) {
             publish_stop();
             goal_active_ = false;
             cached_global_path_odom_.clear();
+            consecutive_fails_ = 0;
             RCLCPP_INFO(get_logger(), "Goal reached! (dist=%.2fm)", dist);
             return;
         }
@@ -480,7 +523,11 @@ private:
 
             auto grid_path = astar_plan(costmap, {start_r, start_c}, {goal_r, goal_c});
             if (grid_path.empty()) {
-                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "A* no path — stop");
+                // [v6] A* failure also counts toward recovery
+                ++consecutive_fails_;
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                    "A* no path (fail %d/%d)", consecutive_fails_, recovery_fail_count_);
+                trigger_recovery_if_needed();
                 publish_stop();
                 return;
             }
@@ -507,6 +554,8 @@ private:
         // 7. Pure Pursuit target
         double pursuit_lx, pursuit_ly;
         if (!find_pure_pursuit_target(robot_x, robot_y, robot_yaw, pursuit_lx, pursuit_ly)) {
+            ++consecutive_fails_;
+            trigger_recovery_if_needed();
             publish_stop();
             return;
         }
@@ -524,11 +573,41 @@ private:
 
         // 9. DWA
         auto [best_v, best_w, best_traj] = dwa_plan(costmap, local_path, pursuit_lx, pursuit_ly);
+        bool dwa_failed = (best_v == 0.0 && best_w == 0.0 && best_traj.empty());
+
+        if (dwa_failed) {
+            ++consecutive_fails_;
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                "DWA: no valid trajectory (fail %d/%d)", consecutive_fails_, recovery_fail_count_);
+            trigger_recovery_if_needed();
+            publish_stop();
+            return;
+        }
+
+        // Success → reset counter
+        consecutive_fails_ = 0;
 
         publish_local_trajectory(best_traj, now(), robot_x, robot_y, robot_yaw);
 
         // 10. Command
         publish_cmd(best_v, best_w);
+    }
+
+    // [v6] Check if recovery should start
+    void trigger_recovery_if_needed()
+    {
+        if (!recovery_enabled_) return;
+        if (consecutive_fails_ < recovery_fail_count_) return;
+        if (recovery_attempts_ >= recovery_max_attempts_) return;
+        if (recovery_active_) return;
+
+        recovery_active_ = true;
+        recovery_start_time_ = get_clock()->now();
+        ++recovery_attempts_;
+        RCLCPP_WARN(get_logger(),
+            "Recovery #%d/%d: backing up %.2f m/s for %.1fs",
+            recovery_attempts_, recovery_max_attempts_,
+            recovery_reverse_vel_, recovery_reverse_duration_);
     }
 
     // =====================================================================
@@ -646,7 +725,7 @@ private:
     }
 
     // =====================================================================
-    // DWA Local Planner  [v3: anti-spin + rectangular footprint]
+    // DWA Local Planner  [v5: 2-tier collision — center hard, perimeter soft]
     // =====================================================================
     struct DWAResult {
         double v, w;
@@ -668,27 +747,28 @@ private:
         const double half = costmap_size_ / 2.0;
         const int lethal = static_cast<int>(astar_lethal_);
 
-        // [v3] Heading error to pure pursuit target (for spin decision)
+        // Heading error for spin decision
         double heading_to_goal = std::atan2(goal_local_y, goal_local_x);
         double abs_heading_err = std::abs(heading_to_goal);
 
-        // [v4] Footprint: perimeter-only check (corners + edges)
-        // Interior is guaranteed clear if perimeter is clear.
+        // Footprint perimeter sample points (robot frame)
         double half_l = robot_length_ / 2.0 + clearance_margin_;
         double half_w = robot_width_ / 2.0 + clearance_margin_;
-        double fp_step = costmap_resolution_ * 3.0;  // coarser sampling (0.3m)
+        double fp_step = costmap_resolution_ * 3.0;
         struct FPPoint { double x, y; };
         std::vector<FPPoint> footprint_pts;
-        // Front/back edges
         for (double fy = -half_w; fy <= half_w; fy += fp_step) {
             footprint_pts.push_back({ half_l, fy});
             footprint_pts.push_back({-half_l, fy});
         }
-        // Left/right edges (skip corners already added)
         for (double fx = -half_l + fp_step; fx < half_l; fx += fp_step) {
             footprint_pts.push_back({fx,  half_w});
             footprint_pts.push_back({fx, -half_w});
         }
+
+        // Inscribed radius: hard reject if obstacle within this distance
+        double inscribed_r = std::min(robot_length_, robot_width_) / 2.0;
+        int inscribed_cells = static_cast<int>(std::ceil(inscribed_r / costmap_resolution_));
 
         double best_score = -std::numeric_limits<double>::infinity();
         double best_v = 0.0, best_w = 0.0;
@@ -701,8 +781,10 @@ private:
                 double w = w_min + (w_max - w_min) * wi / std::max(n_w_samples_ - 1, 1);
 
                 double x = 0.0, y = 0.0, theta = 0.0;
-                bool collision = false;
+                bool hard_collision = false;
                 double min_clearance = std::numeric_limits<double>::max();
+                int total_fp_hits = 0;      // perimeter lethal hit count
+                int total_fp_checks = 0;    // total perimeter checks performed
                 std::vector<std::pair<double, double>> traj;
                 traj.reserve(sim_steps);
 
@@ -712,34 +794,52 @@ private:
                     theta += w * sim_granularity_;
                     traj.emplace_back(x, y);
 
-                    // Center cell check
                     int gc = static_cast<int>((x + half) / costmap_resolution_);
                     int gr = static_cast<int>((y + half) / costmap_resolution_);
+
+                    // Outside costmap — penalize but don't reject
                     if (gc < 0 || gc >= grid_cells_ || gr < 0 || gr >= grid_cells_) {
                         min_clearance = std::min(min_clearance, 0.1);
                         continue;
                     }
-                    int cc_val = costmap->data[gr * grid_cells_ + gc];
-                    if (cc_val >= lethal) { collision = true; break; }
 
-                    // [v4] Oriented rectangular footprint — perimeter only, every 3rd step
+                    // ── Tier 1: CENTER POINT — hard reject ──
+                    int cc_val = costmap->data[gr * grid_cells_ + gc];
+                    if (cc_val >= lethal) {
+                        hard_collision = true;
+                        break;
+                    }
+
+                    // ── Tier 1.5: INSCRIBED CIRCLE — hard reject ──
+                    // Check a small cross pattern (fast approximation)
+                    bool inscribed_hit = false;
+                    for (int d = 1; d <= inscribed_cells && !inscribed_hit; ++d) {
+                        if (gr+d < grid_cells_ && costmap->data[(gr+d)*grid_cells_+gc] >= lethal) inscribed_hit = true;
+                        if (gr-d >= 0          && costmap->data[(gr-d)*grid_cells_+gc] >= lethal) inscribed_hit = true;
+                        if (gc+d < grid_cells_ && costmap->data[gr*grid_cells_+(gc+d)] >= lethal) inscribed_hit = true;
+                        if (gc-d >= 0          && costmap->data[gr*grid_cells_+(gc-d)] >= lethal) inscribed_hit = true;
+                    }
+                    if (inscribed_hit) {
+                        hard_collision = true;
+                        break;
+                    }
+
+                    // ── Tier 2: PERIMETER — soft penalty (every 3rd step) ──
                     if (s % 3 == 0) {
                         double cos_t = std::cos(theta);
                         double sin_t = std::sin(theta);
-                        bool fp_hit = false;
                         for (const auto &fp : footprint_pts) {
                             double wx = x + cos_t * fp.x - sin_t * fp.y;
                             double wy = y + sin_t * fp.x + cos_t * fp.y;
                             int wc = static_cast<int>((wx + half) / costmap_resolution_);
                             int wr = static_cast<int>((wy + half) / costmap_resolution_);
+                            ++total_fp_checks;
                             if (wc >= 0 && wc < grid_cells_ && wr >= 0 && wr < grid_cells_) {
                                 if (costmap->data[wr * grid_cells_ + wc] >= lethal) {
-                                    fp_hit = true;
-                                    break;
+                                    ++total_fp_hits;
                                 }
                             }
                         }
-                        if (fp_hit) { collision = true; break; }
                     }
 
                     // Terrain clearance
@@ -749,20 +849,28 @@ private:
                     }
                 }
 
-                if (collision) continue;
+                // Hard collision (center or inscribed circle) → reject
+                if (hard_collision) continue;
 
-                // ── Scoring [v3] ──
+                // Perimeter: >50% lethal → reject (surrounded by obstacles)
+                double fp_hit_ratio = 0.0;
+                if (total_fp_checks > 0) {
+                    fp_hit_ratio = static_cast<double>(total_fp_hits) / total_fp_checks;
+                    if (fp_hit_ratio > 0.5) continue;
+                }
 
-                // (a) Heading: cosine-based (gentle for small errors)
+                // ── Scoring ──
+
+                // (a) Heading: cosine-based
                 double ang = std::atan2(goal_local_y - y, goal_local_x - x);
                 double herr = std::abs(normalize_angle(ang - theta));
-                double heading_score = (1.0 + std::cos(herr)) / 2.0;  // 1.0 at 0, 0.0 at π
+                double heading_score = (1.0 + std::cos(herr)) / 2.0;
 
                 // (b) Clearance
                 double clearance_score = (min_clearance < std::numeric_limits<double>::max())
                     ? min_clearance : 1.0;
 
-                // (c) Velocity: strong forward preference
+                // (c) Velocity: forward preference
                 double velocity_score = 0.0;
                 if (max_lin_vel_ > 0.0) {
                     velocity_score = v / max_lin_vel_;
@@ -780,7 +888,7 @@ private:
                     path_dist_score = std::max(0.0, 1.0 - min_d);
                 }
 
-                // [v3] (e) Spin penalty: discourage v≈0 rotation when heading < 60°
+                // (e) Spin penalty
                 double spin_penalty = 0.0;
                 if (abs_heading_err < spin_heading_threshold_) {
                     if (std::abs(v) < 0.05 && std::abs(w) > 0.1) {
@@ -788,11 +896,16 @@ private:
                     }
                 }
 
+                // (f) Footprint proximity penalty — proportional to perimeter hits
+                //     0 hits → 0 penalty, 50% hits → -1.0 penalty
+                double fp_penalty = -2.0 * fp_hit_ratio;
+
                 double score = w_heading_ * heading_score
                              + w_clearance_ * clearance_score
                              + w_velocity_ * velocity_score
                              + w_path_dist_ * path_dist_score
-                             + spin_penalty;
+                             + spin_penalty
+                             + fp_penalty;
 
                 if (score > best_score) {
                     best_score = score;
@@ -933,6 +1046,12 @@ private:
     rclcpp::Time last_replan_time_{0, 0, RCL_ROS_TIME};
     bool need_replan_ = true;
 
+    // [v6] Recovery state
+    int consecutive_fails_ = 0;         // counts A* + DWA + pursuit failures
+    bool recovery_active_ = false;
+    rclcpp::Time recovery_start_time_{0, 0, RCL_ROS_TIME};
+    int recovery_attempts_ = 0;
+
     // Parameters
     double costmap_size_, costmap_resolution_;
     int grid_cells_;
@@ -952,6 +1071,13 @@ private:
     double pure_pursuit_lookahead_, pure_pursuit_lookahead_min_, pure_pursuit_lookahead_max_;
     double velocity_lookahead_gain_;
     double spin_heading_threshold_;
+
+    // [v6] Recovery parameters
+    bool recovery_enabled_;
+    int recovery_fail_count_;
+    double recovery_reverse_vel_;
+    double recovery_reverse_duration_;
+    int recovery_max_attempts_;
 };
 
 // =========================================================================
