@@ -2,13 +2,17 @@
     ros__parameters:
         # FAST-LIO2 config for Pacecat LDS-M300-E on DONKEYBOTI
         # [OPT] point_filter_num: 3        # 원본
-        point_filter_num: 2                 # [OPT] 변경 — 포인트 50% 더 사용, 급격한 움직임 시 매칭 안정성
+        # point_filter_num: 2              # [OPT-v1] 변경 — 포인트 50% 더 사용
+        point_filter_num: 1                # [OPT-v2] 변경 — 야외 희소 환경에서 모든 포인트 사용
         # [OPT] max_iteration: 3            # 원본
-        max_iteration: 4                    # [OPT] 변경 — IEKF 수렴 여유 확보
+        # max_iteration: 4                  # [OPT-v1] 변경 — IEKF 수렴 여유 확보
+        max_iteration: 5                    # [OPT-v2] 변경 — 희소 포인트 환경에서 수렴 안정성 강화
         # [OPT] filter_size_surf: 0.5       # 원본
-        filter_size_surf: 0.3               # [OPT] 변경 — 더 세밀한 scan-to-map 매칭
+        # filter_size_surf: 0.3             # [OPT-v1] 변경 — 더 세밀한 scan-to-map 매칭
+        filter_size_surf: 0.2               # [OPT-v2] 변경 — 야외 풀밭에서 디테일 보존
         # [OPT] filter_size_map: 0.5        # 원본
-        filter_size_map: 0.3                # [OPT] 변경 — 맵 해상도 향상, 동적 물체 포인트 빠른 갱신
+        # filter_size_map: 0.3              # [OPT-v1] 변경 — 맵 해상도 향상
+        filter_size_map: 0.25               # [OPT-v2] 변경 — 희소 환경에서 맵 해상도 추가 향상
         # [OPT] cube_side_length: 1000.0    # 원본
         cube_side_length: 500.0             # [OPT] 변경 — 오래된 맵 포인트 더 빨리 제거
         runtime_pos_log_enable: false
@@ -28,9 +32,11 @@
 
         mapping:
             # [OPT] acc_cov: 0.1         # 원본 — IMU 불신
-            acc_cov: 0.01                 # [OPT] 변경 — IMU 더 신뢰, 급격한 움직임 시 LiDAR 블러 보완
+            # acc_cov: 0.01              # [OPT-v1] 변경 — IMU 더 신뢰
+            acc_cov: 0.05                # [OPT-v2] 변경 — 궤도차량 진동이 크므로 IMU 신뢰도 낮춤
             # [OPT] gyr_cov: 0.1         # 원본 — IMU 불신
-            gyr_cov: 0.01                 # [OPT] 변경 — IMU 더 신뢰
+            # gyr_cov: 0.01              # [OPT-v1] 변경 — IMU 더 신뢰
+            gyr_cov: 0.05                # [OPT-v2] 변경 — 궤도차량 진동 보상
             b_acc_cov: 0.0001
             b_gyr_cov: 0.0001
             fov_degree: 360.0
