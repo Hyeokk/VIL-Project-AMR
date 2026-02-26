@@ -8,6 +8,9 @@
 #   camera_init -> body (FAST-LIO2, dynamic)
 #   body -> base_footprint (static offset)
 #   base_footprint -> base_link (URDF)
+#
+# All parameters from YAML (param/m300.yaml)
+# Topic remappings kept as launch args for flexibility
 
 import os
 import launch
