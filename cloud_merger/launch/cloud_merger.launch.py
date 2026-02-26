@@ -13,14 +13,6 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('param_file', default_value=default_param_file,
                               description='Path to parameter YAML file'),
-        DeclareLaunchArgument('m300_topic', default_value='/cloud_registered_body'),
-        DeclareLaunchArgument('s10_topic', default_value='/lx_camera_node/LxCamera_Cloud'),
-        DeclareLaunchArgument('merged_topic', default_value='/merged_cloud'),
-        DeclareLaunchArgument('enable_height_filter', default_value='true'),
-        DeclareLaunchArgument('max_height_from_ground', default_value='2.0',
-                              description='Max height from ground [m]'),
-        DeclareLaunchArgument('sensor_height', default_value='0.63',
-                              description='Body frame height from ground [m]'),
 
         # Static TF: base_link -> mrdvs_tof (S10 Ultra mount position)
         # x=0.35m forward, z=0.35m up from base_link
@@ -41,22 +33,14 @@ def generate_launch_description():
             ],
         ),
 
-        # Cloud merger node
+        # Cloud merger node — all parameters from YAML
         Node(
             package='cloud_merger',
             executable='cloud_merger_node',
             name='cloud_merger',
             output='screen',
             parameters=[
-                LaunchConfiguration('param_file'),    # YAML base params
-                {                                     # CLI overrides
-                    'm300_topic': LaunchConfiguration('m300_topic'),
-                    's10_topic': LaunchConfiguration('s10_topic'),
-                    'merged_topic': LaunchConfiguration('merged_topic'),
-                    'enable_height_filter': LaunchConfiguration('enable_height_filter'),
-                    'max_height_from_ground': LaunchConfiguration('max_height_from_ground'),
-                    'sensor_height': LaunchConfiguration('sensor_height'),
-                },
+                LaunchConfiguration('param_file'),
             ],
         ),
     ])
