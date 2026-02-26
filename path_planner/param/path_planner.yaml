@@ -3,7 +3,9 @@
 #
 # Costmap: 5m x 5m, 0.1m resolution = 50x50 cells
 # Robot: differential-drive (skid-steer), turn-in-place capable
-# [v2] 야외 풀밭 테스트 결과 반영: A* 지형 비용 과민 → 제자리 회전/우회 문제 수정
+#
+# [v2] A* terrain cost tuning for outdoor grass
+# [v3] Anti-spin fixes: goal frame transform, DWA forward-bias, rectangular footprint
 
 path_planner_node:
   ros__parameters:
@@ -11,7 +13,7 @@ path_planner_node:
     costmap_size: 5.0           # [m] side length
     costmap_resolution: 0.1     # [m] cell size → 50x50
 
-    # --- Robot kinematics (DONKEYBOTI.yaml) ---
+    # --- Robot kinematics ---
     max_lin_vel: 0.6            # [m/s] max forward velocity
     min_lin_vel: -0.2           # [m/s] max reverse (limited for safety)
     max_ang_vel: 0.5            # [rad/s] max turn rate
@@ -20,33 +22,36 @@ path_planner_node:
 
     # --- DWA sampling ---
     n_v_samples: 11             # linear velocity samples
-    n_w_samples: 21             # angular velocity samples (more for turn-in-place)
+    n_w_samples: 21             # angular velocity samples
     sim_time: 1.5               # [s] forward simulation horizon
     sim_granularity: 0.1        # [s] simulation time step
 
     # --- DWA scoring weights ---
-    weight_heading: 1.0         # alignment to A* path direction
+    # [v3] Rebalanced: velocity↑, heading↓ to prevent unnecessary spinning
+    # weight_heading: 1.0       # [v1-v2]
+    weight_heading: 0.6         # [v3] heading alignment (reduced)
     weight_clearance: 0.5       # terrain cost / obstacle distance
-    weight_velocity: 0.3        # prefer forward motion
+    # weight_velocity: 0.3      # [v1-v2]
+    weight_velocity: 0.8        # [v3] forward motion preference (increased)
     weight_path_dist: 0.8       # closeness to A* global path
 
     # --- Goal tolerance ---
-    goal_xy_tolerance: 0.2      # [m] position tolerance
-    goal_yaw_tolerance: 0.15    # [rad] ~8.6° heading tolerance
+    goal_xy_tolerance: 0.3      # [m] position tolerance (stop when this close)
+    # goal_yaw_tolerance not used — robot stops on position only
 
     # --- A* configuration ---
-    # astar_lethal_cost: 80.0   # [v1] cells >= this value are impassable
-    astar_lethal_cost: 90.0     # [v2] lethal 판정을 더 보수적으로 (풀밭 셀이 lethal로 잡히는 것 방지)
-    # astar_cost_weight: 2.0    # [v1] terrain cost penalty multiplier
-    astar_cost_weight: 1.0      # [v2] 지형 비용 페널티 절반 → 직선 경로 선호
+    astar_lethal_cost: 90.0     # [v2] cells >= this are impassable
+    astar_cost_weight: 1.0      # [v2] terrain cost penalty
 
-    # --- Robot footprint (rectangular, DONKEYBOTI actual size) ---
+    # --- Robot footprint (rectangular) ---
+    # [v3] Replaced robot_radius with actual dimensions
+    # Collision check uses oriented rectangle, not circle
     robot_length: 1.432         # [m] front-to-back (x-axis)
     robot_width: 0.850          # [m] left-to-right (y-axis)
     clearance_margin: 0.1       # [m] extra safety buffer around footprint
 
     # --- Control ---
-    control_rate: 20.0          # [Hz] control loop frequency (20Hz for smooth motion)
+    control_rate: 20.0          # [Hz]
 
     # --- Frames ---
     odom_frame: "odom"
@@ -57,16 +62,19 @@ path_planner_node:
     goal_topic: "/goal_pose"
     cmd_vel_topic: "/cmd_vel"
 
-    # --- Slope speed reduction (future: IMU integration) ---
-    slope_speed_factor: 0.5     # reduce max_v by this factor on slopes
-    slope_threshold_deg: 15.0   # [deg] slope angle to trigger speed reduction
+    # --- Slope speed reduction ---
+    slope_speed_factor: 0.5
+    slope_threshold_deg: 15.0
 
-    # ============================================================
-    # --- Path Caching & Pure Pursuit (smooth motion) ---
-    # ============================================================
-    replan_interval: 1.0              # [s] 주기적 A* 재계산 간격 (1초마다)
-    path_deviation_threshold: 0.5     # [m] 로봇이 경로에서 이만큼 벗어나면 재계산
-    pure_pursuit_lookahead: 0.4       # [m] Pure Pursuit 기본 lookahead 거리
-    pure_pursuit_lookahead_min: 0.2   # [m] 최소 lookahead (저속 시)
-    pure_pursuit_lookahead_max: 0.8   # [m] 최대 lookahead (고속 시)
+    # --- Path Caching & Pure Pursuit ---
+    replan_interval: 1.0              # [s] periodic A* replan interval
+    path_deviation_threshold: 0.5     # [m] replan if robot deviates this far
+    pure_pursuit_lookahead: 0.4       # [m] base lookahead distance
+    pure_pursuit_lookahead_min: 0.2   # [m] minimum lookahead (low speed)
+    pure_pursuit_lookahead_max: 0.8   # [m] maximum lookahead (high speed)
     velocity_lookahead_gain: 0.5      # lookahead = base + gain * |v|
+
+    # --- [v3] Spin prevention ---
+    # When heading error to goal < this threshold, penalize pure rotation (v≈0, |w|>0)
+    # Forces robot to drive forward while turning instead of spinning in place
+    spin_heading_threshold: 1.05      # [rad] ~60°
