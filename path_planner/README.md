@@ -42,7 +42,7 @@ Collision checking uses a **rectangular footprint** (1.432m × 0.85m) that rotat
 | Topic | Type | Description |
 |-------|------|-------------|
 | `/terrain_costmap` | `nav_msgs/OccupancyGrid` | 5m × 5m traversability costmap (from `terrain_costmap_node`) |
-| `/goal_pose` | `geometry_msgs/PoseStamped` | Navigation target in odom frame |
+| `/goal_pose` | `geometry_msgs/PoseStamped` | Navigation target (any frame, auto-transformed to odom) |
 
 ### Publications
 
@@ -124,7 +124,7 @@ ros2 launch path_planner path_planner.launch.py max_lin_vel:=0.15 max_ang_vel:=0
 |----------|---------|-------------|
 | `max_lin_vel` | `0.6` | Maximum linear velocity [m/s] |
 | `max_ang_vel` | `0.5` | Maximum angular velocity [rad/s] |
-| `control_rate` | `10.0` | Control loop rate [Hz] |
+| `control_rate` | `20.0` | Control loop rate [Hz] |
 
 ## Key Parameters
 
@@ -160,43 +160,54 @@ Effective footprint per collision check: **1.632m × 1.05m** (with margin).
 | `n_w_samples` | 21 | Angular velocity samples (more for turn-in-place) |
 | `sim_time` | 1.5 | Forward simulation horizon [s] |
 | `sim_granularity` | 0.1 | Simulation time step [s] |
-| `weight_heading` | 1.0 | Alignment to A* path direction |
+| `weight_heading` | 0.6 | Alignment to A* path direction |
 | `weight_clearance` | 0.5 | Terrain cost / obstacle avoidance |
-| `weight_velocity` | 0.3 | Forward motion preference |
+| `weight_velocity` | 0.8 | Forward motion preference |
 | `weight_path_dist` | 0.8 | Closeness to A* global path |
+| `spin_heading_threshold` | 1.05 | Heading error [rad] below which pure rotation is penalized |
 
 ### A* Tuning
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `astar_lethal_cost` | 80 | Cells ≥ this value are impassable |
-| `astar_cost_weight` | 2.0 | Terrain cost penalty multiplier |
+| `astar_lethal_cost` | 90 | Cells ≥ this value are impassable |
+| `astar_cost_weight` | 1.0 | Terrain cost penalty multiplier |
 
 ### Goal Tolerance
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `goal_xy_tolerance` | 0.2 | Position tolerance [m] |
-| `goal_yaw_tolerance` | 0.15 | Heading tolerance [rad] (~8.6°) |
+| `goal_xy_tolerance` | 0.3 | Position tolerance [m] — robot stops on position only, no yaw alignment |
+
+### Path Caching & Pure Pursuit
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `replan_interval` | 1.0 | Periodic A* replan interval [s] |
+| `path_deviation_threshold` | 0.5 | Replan if robot deviates this far [m] |
+| `pure_pursuit_lookahead` | 0.4 | Base lookahead distance [m] |
+| `pure_pursuit_lookahead_min` | 0.2 | Minimum lookahead (low speed) [m] |
+| `pure_pursuit_lookahead_max` | 0.8 | Maximum lookahead (high speed) [m] |
+| `velocity_lookahead_gain` | 0.5 | lookahead = base + gain × |v| |
 
 ## Behavior
 
-### Control Loop (10 Hz)
+### Control Loop (20 Hz)
 
 Each cycle executes the following:
 
 1. Receive latest `/terrain_costmap` (50×50 OccupancyGrid)
 2. Look up robot pose via TF (`odom → base_link`)
-3. If distance to goal < `goal_xy_tolerance` → align heading, then stop
-4. Transform goal to robot-local coordinates
-5. If goal is outside costmap (5m) → project intermediate waypoint to costmap boundary
-6. **A\*** searches the 50×50 grid for a global path
-7. **DWA** evaluates 231 velocity candidates `(v, ω)` and selects the best trajectory
+3. If distance to goal < `goal_xy_tolerance` → stop immediately
+4. A* replan only when needed (new goal / deviation / periodic interval)
+5. Pure Pursuit selects stable lookahead point on cached odom-frame path
+6. If goal is outside costmap (5m) → project intermediate waypoint to costmap boundary
+7. **DWA** evaluates 231 velocity candidates `(v, ω)` with anti-spin scoring
 8. Publish `Twist` on `/cmd_vel` → `robot_control` converts to serial `$cVW,v,w`
 
 ### Turn-in-Place (Caterpillar)
 
-When the heading error to the goal is large, DWA naturally selects `v ≈ 0, ω ≠ 0` combinations that score highest. This produces turn-in-place behavior without any special-case logic.
+When the heading error to the goal exceeds `spin_heading_threshold` (~60°), DWA allows `v ≈ 0, ω ≠ 0` combinations. Below this threshold, pure rotation is penalized to prevent unnecessary spinning.
 
 ### Emergency Stop
 
@@ -209,7 +220,7 @@ The planner issues `v = 0, ω = 0` when:
 
 ### Goal Outside Costmap
 
-When the goal is beyond the 5m × 5m costmap range, the planner projects an intermediate waypoint to the costmap boundary in the direction of the goal. The robot navigates toward this intermediate point, and replans each cycle as new costmap data arrives.
+When the goal is beyond the 5m × 5m costmap range, the planner projects an intermediate waypoint to the costmap boundary in the direction of the goal. The robot navigates toward this intermediate point, and replans as new costmap data arrives.
 
 ## Monitoring
 
@@ -232,7 +243,7 @@ ros2 topic echo /path_planner/local_trajectory
 | Display Type | Topic | Color |
 |-------------|-------|-------|
 | Map | `/terrain_costmap` | — |
-| Path | `/path_planner/global_path` | Green |
+| Path | `/path_planner/global_path` | Red or Blue |
 | Path | `/path_planner/local_trajectory` | Yellow |
 | TF | — | Show `odom → base_link` chain |
 
@@ -246,7 +257,43 @@ Benchmark results (50×50 grid, 231 DWA trajectories, rectangular footprint):
 | C++ (this package) | ~0.3–1.2 ms | ~2.6 ms |
 | C++ ARM64 (IQ-9075, estimated) | ~0.5–2.5 ms | ~5.2 ms |
 
-With the full upstream pipeline (sensors → FAST-LIO2 → GroundGrid → costmap) consuming ~17 ms, the total end-to-end latency is well within the 100 ms budget for 10 Hz operation.
+With the full upstream pipeline (sensors → FAST-LIO2 → GroundGrid → costmap) consuming ~17 ms, the total end-to-end latency is well within the 50 ms budget for 20 Hz operation.
+
+---
+
+## Field Tuning Guide
+
+Config files: **P** = `path_planner.yaml`, **T** = `terrain_costmap.yaml`, **G** = `groundgrid/m300.yaml`, **F** = `fast_lio/m300.yaml`
+
+All YAML changes take effect on node restart (no rebuild). Runtime: `ros2 param set /node_name param value`
+
+| Parameter | File | Increase when | Decrease when |
+|-----------|------|--------------|---------------|
+| `weight_heading` | P | Robot ignores goal direction | Robot spins in place |
+| `weight_velocity` | P | Robot spins instead of driving forward | Robot ignores obstacles to go fast |
+| `weight_clearance` | P | Robot too close to obstacles | Robot detours around everything |
+| `weight_path_dist` | P | Robot strays from planned path | Robot can't deviate to avoid obstacles |
+| `spin_heading_threshold` | P | Still spins at small heading errors | Drives forward when it should turn |
+| `astar_cost_weight` | P | Robot cuts through rough terrain | Robot detours on passable ground |
+| `astar_lethal_cost` | P | "No valid trajectory" on passable cells | Robot drives into obstacles |
+| `clearance_margin` | P | Robot bumps into obstacles | "No valid trajectory" in tight spaces |
+| `goal_xy_tolerance` | P | Robot circles around goal | Robot stops too far from target |
+| `max_lin_vel` | P | Robot too slow on flat ground | Robot overshoots goal |
+| `replan_interval` | P | Robot jitters during straight driving | Robot reacts slowly to new obstacles |
+| `pure_pursuit_lookahead` | P | Robot oscillates left-right | Robot cuts corners |
+| `sim_time` | P | "No valid trajectory" near obstacles | DWA too slow (CPU) |
+| `weight_slope` | T | Robot drives off steep edges | Robot detours on gentle slopes |
+| `weight_roughness` | T | Robot on dangerously rough ground | Robot avoids normal grass |
+| `roughness_max` | T | Grass flagged as high cost | Robot ignores rough terrain |
+| `obstacle_count_max` | T | Grass points create false obstacles | Real small obstacles ignored |
+| `lethal_threshold` | T | "No valid trajectory" too often | Robot drives into obstacles |
+| `obstacle_decay_time` | T | Moving obstacles clear too fast | Ghost obstacles persist |
+| `min_point_height_obstacle_thres` | G | Grass classified as obstacle | Low obstacles (curbs) missed |
+| `outlier_tolerance` | G | Grass tips flagged as outliers | Noise accepted as ground |
+| `filter_size_surf` | F | CPU too high | Localization drifting |
+| `acc_cov` / `gyr_cov` | F | Caterpillar vibration causes drift | Position jumps randomly |
+
+---
 
 ## File Structure
 
