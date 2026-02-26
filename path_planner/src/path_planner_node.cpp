@@ -672,16 +672,22 @@ private:
         double heading_to_goal = std::atan2(goal_local_y, goal_local_x);
         double abs_heading_err = std::abs(heading_to_goal);
 
-        // [v3] Rectangular footprint sample points (robot frame)
-        // Pre-compute footprint cells to check at each simulation step
+        // [v4] Footprint: perimeter-only check (corners + edges)
+        // Interior is guaranteed clear if perimeter is clear.
         double half_l = robot_length_ / 2.0 + clearance_margin_;
         double half_w = robot_width_ / 2.0 + clearance_margin_;
+        double fp_step = costmap_resolution_ * 3.0;  // coarser sampling (0.3m)
         struct FPPoint { double x, y; };
         std::vector<FPPoint> footprint_pts;
-        for (double fx = -half_l; fx <= half_l; fx += costmap_resolution_) {
-            for (double fy = -half_w; fy <= half_w; fy += costmap_resolution_) {
-                footprint_pts.push_back({fx, fy});
-            }
+        // Front/back edges
+        for (double fy = -half_w; fy <= half_w; fy += fp_step) {
+            footprint_pts.push_back({ half_l, fy});
+            footprint_pts.push_back({-half_l, fy});
+        }
+        // Left/right edges (skip corners already added)
+        for (double fx = -half_l + fp_step; fx < half_l; fx += fp_step) {
+            footprint_pts.push_back({fx,  half_w});
+            footprint_pts.push_back({fx, -half_w});
         }
 
         double best_score = -std::numeric_limits<double>::infinity();
@@ -716,23 +722,25 @@ private:
                     int cc_val = costmap->data[gr * grid_cells_ + gc];
                     if (cc_val >= lethal) { collision = true; break; }
 
-                    // [v3] Oriented rectangular footprint check
-                    double cos_t = std::cos(theta);
-                    double sin_t = std::sin(theta);
-                    bool fp_hit = false;
-                    for (const auto &fp : footprint_pts) {
-                        double wx = x + cos_t * fp.x - sin_t * fp.y;
-                        double wy = y + sin_t * fp.x + cos_t * fp.y;
-                        int wc = static_cast<int>((wx + half) / costmap_resolution_);
-                        int wr = static_cast<int>((wy + half) / costmap_resolution_);
-                        if (wc >= 0 && wc < grid_cells_ && wr >= 0 && wr < grid_cells_) {
-                            if (costmap->data[wr * grid_cells_ + wc] >= lethal) {
-                                fp_hit = true;
-                                break;
+                    // [v4] Oriented rectangular footprint — perimeter only, every 3rd step
+                    if (s % 3 == 0) {
+                        double cos_t = std::cos(theta);
+                        double sin_t = std::sin(theta);
+                        bool fp_hit = false;
+                        for (const auto &fp : footprint_pts) {
+                            double wx = x + cos_t * fp.x - sin_t * fp.y;
+                            double wy = y + sin_t * fp.x + cos_t * fp.y;
+                            int wc = static_cast<int>((wx + half) / costmap_resolution_);
+                            int wr = static_cast<int>((wy + half) / costmap_resolution_);
+                            if (wc >= 0 && wc < grid_cells_ && wr >= 0 && wr < grid_cells_) {
+                                if (costmap->data[wr * grid_cells_ + wc] >= lethal) {
+                                    fp_hit = true;
+                                    break;
+                                }
                             }
                         }
+                        if (fp_hit) { collision = true; break; }
                     }
-                    if (fp_hit) { collision = true; break; }
 
                     // Terrain clearance
                     if (cc_val >= 0) {
