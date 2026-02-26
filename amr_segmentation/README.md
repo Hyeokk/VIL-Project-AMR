@@ -1,8 +1,27 @@
 # AMR Segmentation
 
-DDRNet23-Slim semantic segmentation deployed to Qualcomm Dragonwing IQ-9075 NPU as FP16.
+Camera-based semantic segmentation pipeline for autonomous mountain terrain navigation.
+
+DDRNet23-Slim (FP16) runs on Qualcomm Dragonwing IQ-9075 NPU via ONNX Runtime QNN EP.
+RGB segmentation mask is fused with M300 LiDAR and S10 Ultra depth to produce a 6m×6m semantic costmap.
 
 Model trained in [TerrainSegmentation](https://github.com/Hyeokk/VIL-Project-TerrainSegmentation) (datasets, hyperparameters, model selection).
+
+---
+
+## 7-Class Semantic Ontology
+
+| ID | Class | Costmap Cost | Traversability |
+|----|-------|:------------:|----------------|
+| 0 | Smooth Ground | 0 | Free |
+| 1 | Rough Ground | 40 | Mild penalty |
+| 2 | Bumpy Ground | 60 | Moderate penalty |
+| 3 | Obstacle | 100 | Lethal |
+| 4 | Vegetation | 30 | Low penalty |
+| 5 | Sky | 0 | Ignored |
+| 6 | Other | 80 | Conservative |
+
+Points outside camera FOV are assigned classes via geometric fallback (height-based rules).
 
 ---
 
@@ -15,20 +34,6 @@ Model trained in [TerrainSegmentation](https://github.com/Hyeokk/VIL-Project-Ter
 | Latency | ~62ms (15.9 FPS) | ~10ms (100+ FPS) |
 
 FP16 is 4.3x faster because it runs as a single NPU graph. INT8 QDQ is split into 8 subgraphs by ONNX Runtime, causing repeated NPU-CPU data transfers that dominate latency.
-
----
-
-## Pipeline
-
-| Step | Script | Output |
-|------|--------|--------|
-| 1. ONNX Export | export_onnx.py | FP32 ONNX (bilinear) |
-| 2. Patch Resize | patch_resize_nearest.py | FP32 ONNX (nearest) |
-| 3. Deploy | scp to IQ-9075 | FP16 on NPU |
-
-Step 2 is required because QAIRT 2.40 HTP does not support bilinear Resize. The patch converts all Resize ops to nearest mode, enabling the entire model to run on the NPU as a single graph.
-
-INT8 quantization (quantize_onnx.py) is available but not recommended for this model. See [docs/deployment_details.md](docs/deployment_details.md) for the FP16 vs INT8 comparison.
 
 ---
 
@@ -46,75 +51,133 @@ python3 -m venv ~/ort_env && source ~/ort_env/bin/activate
 pip install onnxruntime-qnn numpy opencv-python-headless
 ```
 
-### Export and Deploy
+### Model
+
+The deployed model is `ddrnet23_slim_unified7class_544x640_nearest.onnx` (FP16). All Resize ops in the original ONNX graph use bilinear interpolation, but QAIRT 2.40 HTP does not support bilinear Resize. This causes the graph to be split into multiple subgraphs with costly NPU-CPU transfers. The nearest-mode variant patches all Resize ops to nearest-neighbor, allowing the entire model to run on the NPU as a single graph (~10ms vs ~62ms).
+
+### Launch
 
 ```bash
-# 1. ONNX export (Host PC)
-python scripts/export_onnx.py \
-    --checkpoint ./checkpoints/ddrnet23-slim/best_model.pth
+# Default launch (NPU enabled, default camera mount)
+ros2 launch amr_segmentation pipeline.launch.py
 
-# 2. Patch resize to nearest (Host PC)
-python scripts/patch_resize_nearest.py \
-    --input deploy/ddrnet23_slim_unified7class_544x640.onnx \
-    --output deploy/ddrnet23_slim_unified7class_544x640_nearest.onnx
+# Custom camera mount position
+ros2 launch amr_segmentation pipeline.launch.py cam_x:=0.40 cam_z:=0.30
 
-# 3. Transfer to device
-scp deploy/ddrnet23_slim_unified7class_544x640_nearest.onnx user@iq9075:~/models/
-
-# 4. Run inference (IQ-9075)
-python3 scripts/infer_qnn_ros2.py \
-    --model ~/models/ddrnet23_slim_unified7class_544x640_nearest.onnx \
-    --topic /camera/s10_ultra/color/image_raw
+# CPU-only inference (no NPU)
+ros2 launch amr_segmentation pipeline.launch.py use_qnn:=false
 ```
+
+---
+
+## Segmentation Test (infer_test.py)
+
+Standalone test script for the segmentation model without the full ROS2 pipeline.
+Model path is fixed to `models/ddrnet23_slim_unified7class_544x640_nearest.onnx`.
+
+### Video Mode (no ROS2 required)
+
+Test with a recorded video file.
+
+```bash
+# Display overlay on screen
+python3 scripts/infer_test.py video --input test.mp4
+
+# Save result to file
+python3 scripts/infer_test.py video --input test.mp4 --output result.mp4
+
+# CPU-only inference (no NPU)
+python3 scripts/infer_test.py video --input test.mp4 --no-qnn
+```
+
+### Camera Mode (ROS2 + S10 Ultra required)
+
+Test with live MRDVS S10 Ultra camera feed (`/lx_camera_node/LxCamera_Rgb`).
+
+```bash
+# Display overlay on screen
+python3 scripts/infer_test.py camera
+
+# Save result to file
+python3 scripts/infer_test.py camera --output result.mp4
+
+# CPU-only inference (no NPU)
+python3 scripts/infer_test.py camera --no-qnn
+```
+
+Both modes display segmentation overlay, inference time (ms), FPS, and class legend. Press `q` to quit.
 
 ---
 
 ## Preprocessing
 
-The ONNX model expects ImageNet-normalized input, not raw camera pixels. All inference scripts handle this automatically. If writing custom inference code, apply:
+The ONNX model expects ImageNet-normalized input, not raw camera pixels. All inference scripts handle this automatically via `segmentation_common.py`. For custom inference code, apply:
 
 | Step | Operation | Result |
 |------|-----------|--------|
 | 1 | BGR to RGB | RGB uint8 |
-| 2 | Resize to 640 x 544 (W x H) | RGB uint8 |
-| 3 | Divide by 255.0 | float32, 0.0 - 1.0 |
+| 2 | Resize to 640 × 544 (W × H), nearest | RGB uint8 |
+| 3 | Divide by 255.0 | float32, 0.0–1.0 |
 | 4 | Subtract mean [0.485, 0.456, 0.406] | float32 |
 | 5 | Divide by std [0.229, 0.224, 0.225] | float32, normalized |
 | 6 | HWC to NCHW | shape (1, 3, 544, 640) |
 
-Feeding raw pixels (0-255) directly produces meaningless output. See [docs/deployment_details.md](docs/deployment_details.md) for code examples and explanation.
+Feeding raw pixels (0–255) directly produces meaningless output.
 
 ---
 
-## Device Inference
+## Calibration
 
-### Video
+No hardcoded calibration files. All obtained from existing infrastructure.
 
-```bash
-# Host PC test
-python scripts/infer_qnn_video.py \
-    --model deploy/ddrnet23_slim_unified7class_544x640_nearest.onnx \
-    --input video.mp4 --backend cpu
+| Parameter | Source | Method |
+|-----------|--------|--------|
+| RGB Intrinsics (K) | S10 Ultra SDK | `/lx_camera_node/LxCamera_RgbInfo` topic |
+| ToF-RGB Extrinsic | S10 Ultra SDK | TF: `mrdvs_tof` → `mrdvs_rgb` |
+| Camera-Robot | pipeline.launch.py | TF: `base_link` → `mrdvs_tof` (static, configurable) |
+| LiDAR-Robot | FAST-LIO2 | TF: `odom` → `base_link` → `body` |
 
-# IQ-9075
-python scripts/infer_qnn_video.py \
-    --model ~/models/ddrnet23_slim_unified7class_544x640_nearest.onnx \
-    --input video.mp4 --output result.mp4
+---
+
+## Configuration
+
+All pipeline parameters are defined in `config/pipeline_params.yaml`.
+
+```yaml
+segmentation_node:
+  ros__parameters:
+    model_path: "~/models/ddrnet23_slim_unified7class_544x640_nearest.onnx"
+    use_qnn: true
+    image_topic: "/lx_camera_node/LxCamera_Rgb"
+    publish_visualization: true
+
+pointcloud_painter_node:
+  ros__parameters:
+    lidar_topic: "/cloud_registered_body"
+    seg_topic: "/segmentation_node/segmentation"
+    caminfo_topic: "/lx_camera_node/LxCamera_RgbInfo"
+    camera_frame: "mrdvs_rgb"
+    enable_geometric_fallback: true
+    tf_timeout_sec: 1.0
+
+semantic_merger_node:
+  ros__parameters:
+    painted_topic: "/pointcloud_painter_node/painted_pointcloud"
+    s10_cloud_topic: "/lx_camera_node/LxCamera_Cloud"
+    seg_topic: "/segmentation_node/segmentation"
+    caminfo_topic: "/lx_camera_node/LxCamera_RgbInfo"
+    robot_frame: "body"
+    grid_size_m: 6.0
+    resolution: 0.1
+    z_min: -1.0
+    z_max: 2.0
 ```
 
-### ROS2
+Camera mount position is adjustable via launch arguments.
 
 ```bash
-python3 scripts/infer_qnn_ros2.py \
-    --model ~/models/ddrnet23_slim_unified7class_544x640_nearest.onnx \
-    --topic /camera/s10_ultra/color/image_raw
+ros2 launch amr_segmentation pipeline.launch.py cam_x:=0.40 cam_z:=0.30
 ```
-
-| Published Topic | Type | Content |
-|-----------------|------|---------|
-| ~/segmentation | sensor_msgs/Image (mono8) | 7-class mask (0-6) |
-| ~/costmap | nav_msgs/OccupancyGrid | 0=free, 100=lethal |
-| ~/overlay | sensor_msgs/Image (bgr8) | Segmentation blend |
 
 ---
 
@@ -122,18 +185,41 @@ python3 scripts/infer_qnn_ros2.py \
 
 ```
 amr_segmentation/
+├── amr_segmentation/               # Python modules
+│   ├── __init__.py
+│   ├── segmentation_common.py      # 7-class constants, preprocessing, ORT session
+│   ├── segmentation_node.py        # RGB → segmentation mask (NPU)
+│   ├── pointcloud_painter_node.py  # M300 LiDAR + mask → painted pointcloud
+│   └── semantic_merger_node.py     # Painted cloud + S10 depth → costmap
+├── config/
+│   └── pipeline_params.yaml        # All node parameters
+├── launch/
+│   └── pipeline.launch.py          # Static TF + 3 nodes
+├── models/
+│   └── *.onnx                      # ONNX models (gitignored)
 ├── scripts/
-│   ├── export_onnx.py              # ONNX export
-│   ├── patch_resize_nearest.py     # bilinear -> nearest conversion
-│   ├── quantize_onnx.py            # INT8 QDQ quantization (optional)
-│   ├── infer_qnn_video.py          # Video inference
-│   └── infer_qnn_ros2.py           # ROS2 live inference
-├── src/
-│   ├── models.py                   # Model factory
-│   └── models_ddrnet.py            # DDRNet builder
-├── deploy/                         # Export artifacts
-├── docs/
-│   ├── deployment_details.md       # FP16 vs INT8, resize, preprocessing
-│   └── troubleshooting.md          # All known issues and fixes
+│   └── infer_test.py               # Offline test (video / camera)
+├── package.xml
+├── setup.py
+├── setup.cfg
 └── README.md
+```
+
+---
+
+## Migration from Previous Packages
+
+This package replaces three previous packages: `groundgrid`, `terrain_costmap`, and `cloud_merger`.
+
+| Before | After | Notes |
+|--------|-------|-------|
+| `groundgrid` | `segmentation_node` | 2-class → 7-class segmentation |
+| `terrain_costmap` | `semantic_merger_node` | Height-only → semantic costmap |
+| `cloud_merger` (static TF) | `pipeline.launch.py` | TF `base_link→mrdvs_tof` migrated |
+
+Update the path planner costmap topic accordingly.
+
+```yaml
+# path_planner/param/path_planner.yaml
+costmap_topic: "/semantic_merger_node/semantic_costmap"  # was /terrain_costmap
 ```
