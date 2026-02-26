@@ -22,10 +22,12 @@
 // Behavior:
 //   1. Receive goal in odom frame
 //   2. A* plans on costmap (robot-centric grid → global waypoints)
-//   3. DWA selects (v, ω) tracking A* path while avoiding obstacles
-//   4. Large heading error → DWA naturally selects turn-in-place (v≈0)
-//   5. Goal outside costmap → intermediate waypoint at costmap boundary
-//   6. No valid trajectory → emergency stop (v=0, ω=0)
+//   3. Global path cached in odom frame; replan only on new goal / deviation / periodic
+//   4. Pure Pursuit selects lookahead on stable cached path
+//   5. DWA selects (v, ω) toward pure pursuit target while avoiding obstacles
+//   6. Large heading error → DWA naturally selects turn-in-place (v≈0)
+//   7. Goal outside costmap → intermediate waypoint at costmap boundary
+//   8. No valid trajectory → emergency stop (v=0, ω=0)
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
@@ -44,6 +46,7 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <thread>
 
 // =========================================================================
 // Helper: normalize angle to [-π, π]
@@ -106,6 +109,29 @@ public:
             "DWA: %d v x %d w = %d trajectories, sim=%.2fs, dt=%.3fs",
             n_v_samples_, n_w_samples_, n_v_samples_ * n_w_samples_,
             sim_time_, sim_granularity_);
+        RCLCPP_INFO(get_logger(),
+            "Path caching: replan_interval=%.1fs, deviation_threshold=%.2fm, "
+            "pure_pursuit_lookahead=%.2fm",
+            replan_interval_, path_deviation_threshold_, pure_pursuit_lookahead_);
+    }
+
+    // ── 종료 시 반드시 정지 명령 발행 ──
+    ~PathPlannerNode() override
+    {
+        send_stop_command();
+    }
+
+    void send_stop_command()
+    {
+        RCLCPP_INFO(get_logger(), "Shutdown: sending stop command to /cmd_vel");
+        geometry_msgs::msg::Twist stop;
+        stop.linear.x = 0.0;
+        stop.angular.z = 0.0;
+        // 여러 번 발행하여 확실히 수신되도록 함
+        for (int i = 0; i < 10; ++i) {
+            pub_cmd_->publish(stop);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
     }
 
 private:
@@ -150,7 +176,7 @@ private:
         declare_parameter<double>("clearance_margin", 0.1); // [m] extra safety margin
 
         // Control rate
-        declare_parameter<double>("control_rate", 10.0);    // [Hz]
+        declare_parameter<double>("control_rate", 20.0);    // [Hz]
 
         // Frames
         declare_parameter<std::string>("odom_frame", "odom");
@@ -164,6 +190,14 @@ private:
         // Slope speed reduction (IMU-based, future extension)
         declare_parameter<double>("slope_speed_factor", 0.5);  // reduce max_v on slope
         declare_parameter<double>("slope_threshold_deg", 15.0);
+
+        // === NEW: Path caching & Pure Pursuit ===
+        declare_parameter<double>("replan_interval", 1.0);             // [s] periodic A* replan
+        declare_parameter<double>("path_deviation_threshold", 0.5);    // [m] replan if robot deviates
+        declare_parameter<double>("pure_pursuit_lookahead", 0.4);      // [m] pure pursuit lookahead distance
+        declare_parameter<double>("pure_pursuit_lookahead_min", 0.2);  // [m] minimum lookahead
+        declare_parameter<double>("pure_pursuit_lookahead_max", 0.8);  // [m] maximum lookahead
+        declare_parameter<double>("velocity_lookahead_gain", 0.5);     // lookahead scales with speed
     }
 
     void load_parameters()
@@ -204,6 +238,14 @@ private:
 
         slope_speed_factor_ = get_parameter("slope_speed_factor").as_double();
         slope_threshold_deg_ = get_parameter("slope_threshold_deg").as_double();
+
+        // NEW
+        replan_interval_ = get_parameter("replan_interval").as_double();
+        path_deviation_threshold_ = get_parameter("path_deviation_threshold").as_double();
+        pure_pursuit_lookahead_ = get_parameter("pure_pursuit_lookahead").as_double();
+        pure_pursuit_lookahead_min_ = get_parameter("pure_pursuit_lookahead_min").as_double();
+        pure_pursuit_lookahead_max_ = get_parameter("pure_pursuit_lookahead_max").as_double();
+        velocity_lookahead_gain_ = get_parameter("velocity_lookahead_gain").as_double();
     }
 
     // =====================================================================
@@ -257,13 +299,107 @@ private:
     {
         goal_ = *msg;
         goal_active_ = true;
+        need_replan_ = true;  // NEW: force replan on new goal
         RCLCPP_INFO(get_logger(), "New goal: (%.2f, %.2f) in frame '%s'",
             msg->pose.position.x, msg->pose.position.y,
             msg->header.frame_id.c_str());
     }
 
     // =====================================================================
-    // Main control loop (10 Hz)
+    // Check if replanning is needed
+    // =====================================================================
+    bool should_replan(double robot_x, double robot_y)
+    {
+        // (1) Forced replan (new goal)
+        if (need_replan_) {
+            need_replan_ = false;
+            return true;
+        }
+
+        // (2) No cached path
+        if (cached_global_path_odom_.empty()) {
+            return true;
+        }
+
+        // (3) Periodic replan
+        auto now = get_clock()->now();
+        double elapsed = (now - last_replan_time_).seconds();
+        if (elapsed >= replan_interval_) {
+            return true;
+        }
+
+        // (4) Robot deviated too far from cached path
+        double min_dist = std::numeric_limits<double>::max();
+        for (const auto &wp : cached_global_path_odom_) {
+            double d = std::hypot(robot_x - wp.first, robot_y - wp.second);
+            min_dist = std::min(min_dist, d);
+        }
+        if (min_dist > path_deviation_threshold_) {
+            RCLCPP_INFO(get_logger(),
+                "Path deviation %.2fm > threshold %.2fm — replanning",
+                min_dist, path_deviation_threshold_);
+            return true;
+        }
+
+        return false;
+    }
+
+    // =====================================================================
+    // Pure Pursuit: find lookahead point on cached odom-frame path
+    // Returns lookahead in robot-local coordinates
+    // =====================================================================
+    bool find_pure_pursuit_target(
+        double robot_x, double robot_y, double robot_yaw,
+        double &target_local_x, double &target_local_y)
+    {
+        if (cached_global_path_odom_.empty()) return false;
+
+        // Adaptive lookahead: scales with velocity
+        double lookahead = pure_pursuit_lookahead_
+                         + velocity_lookahead_gain_ * std::abs(cur_v_);
+        lookahead = std::clamp(lookahead,
+                              pure_pursuit_lookahead_min_,
+                              pure_pursuit_lookahead_max_);
+
+        // Find the closest point on path to robot
+        size_t closest_idx = 0;
+        double closest_dist = std::numeric_limits<double>::max();
+        for (size_t i = 0; i < cached_global_path_odom_.size(); ++i) {
+            double d = std::hypot(
+                cached_global_path_odom_[i].first - robot_x,
+                cached_global_path_odom_[i].second - robot_y);
+            if (d < closest_dist) {
+                closest_dist = d;
+                closest_idx = i;
+            }
+        }
+
+        // Walk forward along path from closest point to find lookahead target
+        double accum_dist = 0.0;
+        size_t target_idx = closest_idx;
+        for (size_t i = closest_idx; i + 1 < cached_global_path_odom_.size(); ++i) {
+            double dx = cached_global_path_odom_[i+1].first - cached_global_path_odom_[i].first;
+            double dy = cached_global_path_odom_[i+1].second - cached_global_path_odom_[i].second;
+            accum_dist += std::hypot(dx, dy);
+            target_idx = i + 1;
+            if (accum_dist >= lookahead) break;
+        }
+
+        // Transform target to robot-local frame
+        double tx_odom = cached_global_path_odom_[target_idx].first;
+        double ty_odom = cached_global_path_odom_[target_idx].second;
+        double dx = tx_odom - robot_x;
+        double dy = ty_odom - robot_y;
+        double cos_y = std::cos(-robot_yaw);
+        double sin_y = std::sin(-robot_yaw);
+        target_local_x = cos_y * dx - sin_y * dy;
+        target_local_y = sin_y * dx + cos_y * dy;
+
+        return true;
+    }
+
+    // =====================================================================
+    // Main control loop (20 Hz)
     // =====================================================================
     void control_loop()
     {
@@ -302,6 +438,7 @@ private:
                 // Goal reached
                 publish_stop();
                 goal_active_ = false;
+                cached_global_path_odom_.clear();
                 RCLCPP_INFO(get_logger(), "Goal reached!");
                 return;
             } else {
@@ -314,66 +451,112 @@ private:
             }
         }
 
-        // 5. Transform goal to robot-local costmap coordinates
-        double goal_local_x =  std::cos(-robot_yaw) * dx - std::sin(-robot_yaw) * dy;
-        double goal_local_y =  std::sin(-robot_yaw) * dx + std::cos(-robot_yaw) * dy;
+        // ============================================================
+        // 5. A* REPLAN ONLY WHEN NEEDED (not every cycle!)
+        // ============================================================
+        if (should_replan(robot_x, robot_y)) {
+            // Transform goal to robot-local costmap coordinates
+            double goal_local_x = std::cos(-robot_yaw) * dx - std::sin(-robot_yaw) * dy;
+            double goal_local_y = std::sin(-robot_yaw) * dx + std::cos(-robot_yaw) * dy;
 
-        // 6. Project goal to costmap boundary if outside
-        double half = costmap_size_ / 2.0;
-        double margin = costmap_resolution_ * 2;
-        bool goal_in_costmap = (std::abs(goal_local_x) < half - margin &&
-                                std::abs(goal_local_y) < half - margin);
+            // Project goal to costmap boundary if outside
+            double half = costmap_size_ / 2.0;
+            double margin = costmap_resolution_ * 2;
+            bool goal_in_costmap = (std::abs(goal_local_x) < half - margin &&
+                                    std::abs(goal_local_y) < half - margin);
 
-        double plan_local_x = goal_local_x;
-        double plan_local_y = goal_local_y;
-        if (!goal_in_costmap) {
-            // Project to costmap boundary along direction to goal
-            double angle = std::atan2(goal_local_y, goal_local_x);
-            double boundary = half - margin;
-            plan_local_x = boundary * std::cos(angle);
-            plan_local_y = boundary * std::sin(angle);
+            double plan_local_x = goal_local_x;
+            double plan_local_y = goal_local_y;
+            if (!goal_in_costmap) {
+                double angle = std::atan2(goal_local_y, goal_local_x);
+                double boundary = half - margin;
+                plan_local_x = boundary * std::cos(angle);
+                plan_local_y = boundary * std::sin(angle);
+            }
+
+            // Convert local coords to grid indices
+            int start_r = grid_cells_ / 2;
+            int start_c = grid_cells_ / 2;
+            int goal_r = static_cast<int>((plan_local_y + half) / costmap_resolution_);
+            int goal_c = static_cast<int>((plan_local_x + half) / costmap_resolution_);
+
+            goal_r = std::clamp(goal_r, 1, grid_cells_ - 2);
+            goal_c = std::clamp(goal_c, 1, grid_cells_ - 2);
+
+            // A* global path
+            auto grid_path = astar_plan(costmap, {start_r, start_c}, {goal_r, goal_c});
+
+            if (grid_path.empty()) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                    "A* found no path — stopping");
+                publish_stop();
+                return;
+            }
+
+            // Convert grid path to local coordinates
+            std::vector<std::pair<double, double>> waypoints_local;
+            waypoints_local.reserve(grid_path.size());
+            for (const auto &cell : grid_path) {
+                double lx = (cell.c + 0.5) * costmap_resolution_ - half;
+                double ly = (cell.r + 0.5) * costmap_resolution_ - half;
+                waypoints_local.emplace_back(lx, ly);
+            }
+
+            // *** Convert to odom frame and cache ***
+            double cos_y = std::cos(robot_yaw);
+            double sin_y = std::sin(robot_yaw);
+            cached_global_path_odom_.clear();
+            cached_global_path_odom_.reserve(waypoints_local.size());
+            for (const auto &[lx, ly] : waypoints_local) {
+                double ox = cos_y * lx - sin_y * ly + robot_x;
+                double oy = sin_y * lx + cos_y * ly + robot_y;
+                cached_global_path_odom_.emplace_back(ox, oy);
+            }
+
+            last_replan_time_ = get_clock()->now();
+
+            RCLCPP_DEBUG(get_logger(), "A* replanned: %zu waypoints",
+                cached_global_path_odom_.size());
         }
 
-        // 7. Convert local coords to grid indices
-        int start_r = grid_cells_ / 2;
-        int start_c = grid_cells_ / 2;
-        int goal_r = static_cast<int>((plan_local_y + half) / costmap_resolution_);
-        int goal_c = static_cast<int>((plan_local_x + half) / costmap_resolution_);
+        // 6. Publish cached global path for visualization
+        if (!cached_global_path_odom_.empty()) {
+            publish_global_path_odom(cached_global_path_odom_, now());
+        }
 
-        goal_r = std::clamp(goal_r, 1, grid_cells_ - 2);
-        goal_c = std::clamp(goal_c, 1, grid_cells_ - 2);
-
-        // 8. A* global path
-        auto grid_path = astar_plan(costmap, {start_r, start_c}, {goal_r, goal_c});
-
-        if (grid_path.empty()) {
+        // ============================================================
+        // 7. Pure Pursuit: find stable lookahead on cached path
+        // ============================================================
+        double pursuit_local_x, pursuit_local_y;
+        if (!find_pure_pursuit_target(robot_x, robot_y, robot_yaw,
+                                       pursuit_local_x, pursuit_local_y))
+        {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                "A* found no path — stopping");
+                "No pure pursuit target — stopping");
             publish_stop();
             return;
         }
 
-        // 9. Convert grid path to local coordinates for DWA
-        std::vector<std::pair<double, double>> waypoints;
-        waypoints.reserve(grid_path.size());
-        for (const auto &cell : grid_path) {
-            double lx = (cell.c + 0.5) * costmap_resolution_ - half;
-            double ly = (cell.r + 0.5) * costmap_resolution_ - half;
-            waypoints.emplace_back(lx, ly);
+        // 8. Convert cached path to robot-local for DWA collision checking
+        double cos_neg_yaw = std::cos(-robot_yaw);
+        double sin_neg_yaw = std::sin(-robot_yaw);
+        std::vector<std::pair<double, double>> local_path;
+        local_path.reserve(cached_global_path_odom_.size());
+        for (const auto &[ox, oy] : cached_global_path_odom_) {
+            double lx = cos_neg_yaw * (ox - robot_x) - sin_neg_yaw * (oy - robot_y);
+            double ly = sin_neg_yaw * (ox - robot_x) + cos_neg_yaw * (oy - robot_y);
+            local_path.emplace_back(lx, ly);
         }
 
-        // Publish global path for visualization
-        publish_global_path(waypoints, costmap->header.stamp, robot_x, robot_y, robot_yaw);
-
-        // 10. DWA local planning
-        auto [best_v, best_w, best_traj] = dwa_plan(costmap, waypoints,
-            plan_local_x, plan_local_y);
+        // 9. DWA local planning (using pure pursuit target instead of raw goal)
+        auto [best_v, best_w, best_traj] = dwa_plan(costmap, local_path,
+            pursuit_local_x, pursuit_local_y);
 
         // Publish local trajectory for visualization
-        publish_local_trajectory(best_traj, costmap->header.stamp,
+        publish_local_trajectory(best_traj, now(),
             robot_x, robot_y, robot_yaw);
 
-        // 11. Publish command
+        // 10. Publish command
         publish_cmd(best_v, best_w);
     }
 
@@ -522,10 +705,11 @@ private:
         double goal_local_x, double goal_local_y)
     {
         // Dynamic window from current velocity
-        double v_min = std::max(min_lin_vel_, cur_v_ - max_lin_acc_ / control_rate_);
-        double v_max = std::min(max_lin_vel_, cur_v_ + max_lin_acc_ / control_rate_);
-        double w_min = std::max(-max_ang_vel_, cur_w_ - max_ang_acc_ / control_rate_);
-        double w_max = std::min(max_ang_vel_, cur_w_ + max_ang_acc_ / control_rate_);
+        double dt = 1.0 / control_rate_;
+        double v_min = std::max(min_lin_vel_, cur_v_ - max_lin_acc_ * dt);
+        double v_max = std::min(max_lin_vel_, cur_v_ + max_lin_acc_ * dt);
+        double w_min = std::max(-max_ang_vel_, cur_w_ - max_ang_acc_ * dt);
+        double w_max = std::min(max_ang_vel_, cur_w_ + max_ang_acc_ * dt);
 
         const int sim_steps = static_cast<int>(std::round(sim_time_ / sim_granularity_));
         const double half = costmap_size_ / 2.0;
@@ -533,25 +717,6 @@ private:
         double best_score = -std::numeric_limits<double>::infinity();
         double best_v = 0.0, best_w = 0.0;
         std::vector<std::pair<double, double>> best_traj;
-
-        // Find the lookahead point on global path
-        // (skip waypoints behind robot, target 0.3~0.5m ahead)
-        double lookahead_x = goal_local_x;
-        double lookahead_y = goal_local_y;
-        if (global_path.size() > 2) {
-            double lookahead_dist = 0.5;  // [m]
-            double accum = 0.0;
-            for (size_t i = 1; i < global_path.size(); ++i) {
-                double dx = global_path[i].first - global_path[i-1].first;
-                double dy = global_path[i].second - global_path[i-1].second;
-                accum += std::hypot(dx, dy);
-                if (accum >= lookahead_dist) {
-                    lookahead_x = global_path[i].first;
-                    lookahead_y = global_path[i].second;
-                    break;
-                }
-            }
-        }
 
         for (int vi = 0; vi < n_v_samples_; ++vi) {
             double v = v_min + (v_max - v_min) * vi / std::max(n_v_samples_ - 1, 1);
@@ -621,8 +786,8 @@ private:
                 if (collision) continue;
 
                 // === Scoring ===
-                // (a) Heading: alignment to lookahead point from trajectory end
-                double angle_to_goal = std::atan2(lookahead_y - y, lookahead_x - x);
+                // (a) Heading: alignment to pure pursuit target from trajectory end
+                double angle_to_goal = std::atan2(goal_local_y - y, goal_local_x - x);
                 double heading_err = std::abs(normalize_angle(angle_to_goal - theta));
                 double heading_score = 1.0 - heading_err / M_PI;
 
@@ -712,23 +877,35 @@ private:
     // =====================================================================
     void publish_cmd(double v, double w)
     {
-        cur_v_ = v;
-        cur_w_ = w;
+        // ── 속도 스무딩 (지수 이동 평균) ──
+        // DWA가 매 사이클 다른 (v,w)를 선택해도 급격한 변화를 완화
+        const double alpha = 0.4;  // 0.0~1.0, 작을수록 부드러움
+        double smoothed_v = cur_v_ + alpha * (v - cur_v_);
+        double smoothed_w = cur_w_ + alpha * (w - cur_w_);
+
+        cur_v_ = smoothed_v;
+        cur_w_ = smoothed_w;
         geometry_msgs::msg::Twist cmd;
-        cmd.linear.x = v;
-        cmd.angular.z = w;
+        cmd.linear.x = smoothed_v;
+        cmd.angular.z = smoothed_w;
         pub_cmd_->publish(cmd);
     }
 
     void publish_stop()
     {
-        publish_cmd(0.0, 0.0);
+        // 긴급 정지는 스무딩 없이 즉시 정지
+        cur_v_ = 0.0;
+        cur_w_ = 0.0;
+        geometry_msgs::msg::Twist cmd;
+        cmd.linear.x = 0.0;
+        cmd.angular.z = 0.0;
+        pub_cmd_->publish(cmd);
     }
 
-    void publish_global_path(
-        const std::vector<std::pair<double, double>> &waypoints,
-        const rclcpp::Time &stamp,
-        double robot_x, double robot_y, double robot_yaw)
+    // Publish cached odom-frame path directly (no per-cycle coordinate transform)
+    void publish_global_path_odom(
+        const std::vector<std::pair<double, double>> &waypoints_odom,
+        const rclcpp::Time &stamp)
     {
         if (pub_global_path_->get_subscription_count() == 0) return;
 
@@ -736,15 +913,11 @@ private:
         path_msg.header.stamp = stamp;
         path_msg.header.frame_id = odom_frame_;
 
-        double cos_y = std::cos(robot_yaw);
-        double sin_y = std::sin(robot_yaw);
-
-        for (const auto &[lx, ly] : waypoints) {
+        for (const auto &[ox, oy] : waypoints_odom) {
             geometry_msgs::msg::PoseStamped ps;
             ps.header = path_msg.header;
-            // Local → odom
-            ps.pose.position.x = cos_y * lx - sin_y * ly + robot_x;
-            ps.pose.position.y = sin_y * lx + cos_y * ly + robot_y;
+            ps.pose.position.x = ox;
+            ps.pose.position.y = oy;
             ps.pose.position.z = 0.0;
             ps.pose.orientation.w = 1.0;
             path_msg.poses.push_back(ps);
@@ -809,6 +982,11 @@ private:
     double cur_v_ = 0.0;  // current velocity (for dynamic window)
     double cur_w_ = 0.0;
 
+    // === NEW: Path caching state ===
+    std::vector<std::pair<double, double>> cached_global_path_odom_;  // odom-frame cached path
+    rclcpp::Time last_replan_time_{0, 0, RCL_ROS_TIME};
+    bool need_replan_ = true;
+
     // Parameters
     double costmap_size_, costmap_resolution_;
     int grid_cells_;
@@ -823,6 +1001,14 @@ private:
     double control_rate_;
     std::string odom_frame_, robot_frame_;
     double slope_speed_factor_, slope_threshold_deg_;
+
+    // NEW: Path caching & Pure Pursuit parameters
+    double replan_interval_;
+    double path_deviation_threshold_;
+    double pure_pursuit_lookahead_;
+    double pure_pursuit_lookahead_min_;
+    double pure_pursuit_lookahead_max_;
+    double velocity_lookahead_gain_;
 };
 
 // =========================================================================
@@ -831,7 +1017,14 @@ private:
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<PathPlannerNode>());
+    auto node = std::make_shared<PathPlannerNode>();
+
+    // SIGINT(Ctrl+C) 시 on_shutdown 콜백으로 정지 명령 발행
+    rclcpp::on_shutdown([node]() {
+        node->send_stop_command();
+    });
+
+    rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }
