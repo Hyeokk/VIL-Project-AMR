@@ -109,6 +109,65 @@ Both modes display segmentation overlay, inference time (ms), FPS, and class leg
 
 ---
 
+## Inference Benchmark (benchmark_infer.py)
+
+Per-stage latency profiling with statistics. Separates **preprocess / inference / postprocess** timings and reports min, max, mean, p50, p95, p99, std. Warmup frames are excluded from statistics to avoid NPU first-compile skew.
+
+### Video Mode (no ROS2 required)
+
+```bash
+# Basic benchmark (300 frames, 20 warmup)
+python3 scripts/benchmark_infer.py video --input test.mp4
+
+# Custom frame count and warmup
+python3 scripts/benchmark_infer.py video --input test.mp4 --frames 500 --warmup 30
+
+# Save overlay video (segmentation mask + per-stage latency + FPS)
+python3 scripts/benchmark_infer.py video --input test.mp4 --output result.mp4
+
+# QNN (NPU) vs CPU automatic comparison
+python3 scripts/benchmark_infer.py video --input test.mp4 --compare
+
+# Save statistics to JSON
+python3 scripts/benchmark_infer.py video --input test.mp4 --save results.json
+```
+
+### Camera Mode (ROS2 + S10 Ultra required)
+
+```bash
+# Live benchmark from S10 Ultra feed
+python3 scripts/benchmark_infer.py camera
+
+# Save overlay video + JSON stats
+python3 scripts/benchmark_infer.py camera --output result.mp4 --save results.json
+
+# CPU-only
+python3 scripts/benchmark_infer.py camera --no-qnn
+```
+
+### Output
+
+Terminal prints a summary table after measurement completes:
+
+```
+  ┌── QNN (NPU)
+  │  Measured frames : 280
+  │  Effective FPS   : 98.3
+  │
+  │  Stage            Mean     Std     Min     P50     P95     P99     Max
+  │  ────────────────────────────────────────────────────────────────────
+  │  Preprocess       1.23    0.15    1.02    1.21    1.48    1.62    1.85
+  │  Inference        8.94    0.43    8.21    8.87    9.68   10.12   11.34
+  │  Postprocess      0.01    0.00    0.01    0.01    0.02    0.02    0.03
+  │  ────────────────────────────────────────────────────────────────────
+  │  ▶ TOTAL         10.18    0.52    9.31   10.12   11.05   11.68   13.02
+  └──────────────────────────────────────────────────────────────────────
+```
+
+`--output result.mp4` overlays segmentation mask, per-stage latency (pre/infer/post), total latency, and FPS on each frame. Warmup frames are not written to the video.
+
+---
+
 ## Preprocessing
 
 The ONNX model expects ImageNet-normalized input, not raw camera pixels. All inference scripts handle this automatically via `segmentation_common.py`. For custom inference code, apply:
@@ -198,7 +257,8 @@ amr_segmentation/
 ├── models/
 │   └── *.onnx                      # ONNX models (gitignored)
 ├── scripts/
-│   └── infer_test.py               # Offline test (video / camera)
+│   ├── infer_test.py               # Offline test (video / camera)
+│   └── benchmark_infer.py          # Per-stage latency profiling
 ├── package.xml
 ├── setup.py
 ├── setup.cfg
