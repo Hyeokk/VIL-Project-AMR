@@ -19,10 +19,14 @@
 // TF Required:
 //   odom → base_link  (from FAST-LIO2 or wheel odometry)
 //
-// [v3] Fixes:
-//   - Goal frame: transform any frame to odom on receipt
-//   - DWA scoring: forward-bias to prevent unnecessary spinning
-//   - Robot footprint: oriented rectangular collision check
+// Version history:
+//   v3: Goal frame transform, DWA forward-bias, rectangular footprint
+//   v5: 2-tier collision (center hard, perimeter soft)
+//   v6: Recovery behavior (backup on consecutive failures)
+//   v7: A* inflation (2-zone: inscribed lethal + outer decay)
+//   v8: Decay-only inflation — fixes inner_r > outer_r bug
+//       Exponential cost decay pushes A* away from walls without blocking paths
+//       Wider inflation radius now safe (no extra lethal cells added)
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
@@ -107,7 +111,7 @@ public:
             w_heading_, w_clearance_, w_velocity_, w_path_dist_,
             spin_heading_threshold_ * 180.0 / M_PI);
         RCLCPP_INFO(get_logger(),
-            "[v7] A* inflation: radius=%.3fm (%d cells), astar_cost_weight=%.1f",
+            "[v8] Decay-only inflation: radius=%.3fm (%d cells), cost_weight=%.1f",
             inflation_radius_,
             static_cast<int>(std::ceil(inflation_radius_ / costmap_resolution_)),
             astar_cost_weight_);
@@ -148,7 +152,6 @@ private:
         declare_parameter<double>("sim_time", 1.5);
         declare_parameter<double>("sim_granularity", 0.1);
 
-        // [v3] Rebalanced defaults
         declare_parameter<double>("weight_heading", 0.6);
         declare_parameter<double>("weight_clearance", 0.5);
         declare_parameter<double>("weight_velocity", 0.8);
@@ -160,7 +163,6 @@ private:
         declare_parameter<double>("astar_lethal_cost", 90.0);
         declare_parameter<double>("astar_cost_weight", 1.0);
 
-        // [v3] Rectangular footprint
         declare_parameter<double>("robot_length", 1.432);
         declare_parameter<double>("robot_width", 0.850);
         declare_parameter<double>("clearance_margin", 0.1);
@@ -184,20 +186,19 @@ private:
         declare_parameter<double>("pure_pursuit_lookahead_max", 0.8);
         declare_parameter<double>("velocity_lookahead_gain", 0.5);
 
-        // [v3]
         declare_parameter<double>("spin_heading_threshold", 1.05);
 
-        // [v6] Recovery behavior
+        // Recovery behavior
         declare_parameter<bool>("recovery_enabled", true);
-        declare_parameter<int>("recovery_fail_count", 5);          // consecutive DWA fails to trigger
-        declare_parameter<double>("recovery_reverse_vel", -0.15);  // [m/s] backup speed
-        declare_parameter<double>("recovery_reverse_duration", 1.5); // [s] how long to back up
-        declare_parameter<int>("recovery_max_attempts", 3);        // max recoveries per goal
+        declare_parameter<int>("recovery_fail_count", 5);
+        declare_parameter<double>("recovery_reverse_vel", -0.15);
+        declare_parameter<double>("recovery_reverse_duration", 1.5);
+        declare_parameter<int>("recovery_max_attempts", 3);
 
-        // [v7] A* inflation — inflates obstacles by robot radius so A* keeps clearance
-        // Default = inscribed radius + clearance_margin = 0.525m
-        // Increase if robot still clips obstacles, decrease if corridors become impassable
-        declare_parameter<double>("inflation_radius", -1.0);  // [m] -1 = auto (inscribed + margin)
+        // [v8] Decay-only inflation
+        // No lethal inner zone — only exponential cost decay
+        // Safe to set larger values without blocking corridors
+        declare_parameter<double>("inflation_radius", -1.0);  // [m] -1 = auto
     }
 
     void load_parameters()
@@ -228,7 +229,6 @@ private:
         astar_lethal_ = get_parameter("astar_lethal_cost").as_double();
         astar_cost_weight_ = get_parameter("astar_cost_weight").as_double();
 
-        // [v3] Rectangular footprint
         robot_length_ = get_parameter("robot_length").as_double();
         robot_width_ = get_parameter("robot_width").as_double();
         clearance_margin_ = get_parameter("clearance_margin").as_double();
@@ -250,18 +250,19 @@ private:
 
         spin_heading_threshold_ = get_parameter("spin_heading_threshold").as_double();
 
-        // [v6] Recovery
+        // Recovery
         recovery_enabled_ = get_parameter("recovery_enabled").as_bool();
         recovery_fail_count_ = get_parameter("recovery_fail_count").as_int();
         recovery_reverse_vel_ = get_parameter("recovery_reverse_vel").as_double();
         recovery_reverse_duration_ = get_parameter("recovery_reverse_duration").as_double();
         recovery_max_attempts_ = get_parameter("recovery_max_attempts").as_int();
 
-        // [v7] Inflation
+        // [v8] Inflation
         inflation_radius_ = get_parameter("inflation_radius").as_double();
         if (inflation_radius_ < 0.0) {
-            // Auto: use inscribed radius + clearance margin
-            inflation_radius_ = std::min(robot_length_, robot_width_) / 2.0 + clearance_margin_;
+            // Auto: inscribed radius + clearance + extra buffer
+            inflation_radius_ = std::min(robot_length_, robot_width_) / 2.0
+                              + clearance_margin_ + 0.2;  // +0.2m extra for decay zone
         }
     }
 
@@ -312,7 +313,6 @@ private:
         costmap_ = msg;
     }
 
-    // [v3] Goal: transform any frame → odom
     void goal_callback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
     {
         geometry_msgs::msg::PoseStamped goal_odom;
@@ -321,12 +321,10 @@ private:
             goal_odom = *msg;
             goal_odom.header.frame_id = odom_frame_;
         } else {
-            // Try TF transform first
             try {
                 goal_odom = tf_buffer_->transform(
                     *msg, odom_frame_, tf2::durationFromSec(0.2));
             } catch (tf2::TransformException &ex) {
-                // Fallback: assume robot-frame goal, manually transform
                 double robot_x, robot_y, robot_yaw;
                 if (!get_robot_pose(robot_x, robot_y, robot_yaw)) {
                     RCLCPP_ERROR(get_logger(),
@@ -364,7 +362,6 @@ private:
         goal_active_ = true;
         need_replan_ = true;
 
-        // [v6] Reset recovery state for new goal
         consecutive_fails_ = 0;
         recovery_active_ = false;
         recovery_attempts_ = 0;
@@ -402,7 +399,7 @@ private:
     }
 
     // =====================================================================
-    // Pure Pursuit: find lookahead on cached odom-frame path
+    // Pure Pursuit
     // =====================================================================
     bool find_pure_pursuit_target(
         double robot_x, double robot_y, double robot_yaw,
@@ -416,7 +413,6 @@ private:
                               pure_pursuit_lookahead_min_,
                               pure_pursuit_lookahead_max_);
 
-        // Find closest point
         size_t closest_idx = 0;
         double closest_dist = std::numeric_limits<double>::max();
         for (size_t i = 0; i < cached_global_path_odom_.size(); ++i) {
@@ -429,7 +425,6 @@ private:
             }
         }
 
-        // Walk forward along path
         double accum = 0.0;
         size_t target_idx = closest_idx;
         for (size_t i = closest_idx; i + 1 < cached_global_path_odom_.size(); ++i) {
@@ -440,7 +435,6 @@ private:
             if (accum >= lookahead) break;
         }
 
-        // Transform to robot-local
         double ddx = cached_global_path_odom_[target_idx].first - robot_x;
         double ddy = cached_global_path_odom_[target_idx].second - robot_y;
         double cos_y = std::cos(-robot_yaw);
@@ -460,11 +454,10 @@ private:
             return;
         }
 
-        // ── [v6] Recovery: handle active backup FIRST ──
+        // Recovery: handle active backup FIRST
         if (recovery_active_) {
             double elapsed = (get_clock()->now() - recovery_start_time_).seconds();
             if (elapsed < recovery_reverse_duration_) {
-                // Still backing up — publish reverse directly (bypass smoothing)
                 geometry_msgs::msg::Twist cmd;
                 cmd.linear.x = recovery_reverse_vel_;
                 cmd.angular.z = 0.0;
@@ -473,13 +466,11 @@ private:
                 cur_w_ = 0.0;
                 return;
             } else {
-                // Backup done → force replan
                 recovery_active_ = false;
                 consecutive_fails_ = 0;
                 need_replan_ = true;
                 cached_global_path_odom_.clear();
                 RCLCPP_INFO(get_logger(), "Recovery complete — replanning");
-                // Fall through to normal planning
             }
         }
 
@@ -498,7 +489,7 @@ private:
         double robot_x, robot_y, robot_yaw;
         if (!get_robot_pose(robot_x, robot_y, robot_yaw)) return;
 
-        // 3. Goal (already in odom frame)
+        // 3. Goal
         double goal_x = goal_.pose.position.x;
         double goal_y = goal_.pose.position.y;
 
@@ -540,7 +531,6 @@ private:
 
             auto grid_path = astar_plan(costmap, {start_r, start_c}, {goal_r, goal_c});
             if (grid_path.empty()) {
-                // [v6] A* failure also counts toward recovery
                 ++consecutive_fails_;
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                     "A* no path (fail %d/%d)", consecutive_fails_, recovery_fail_count_);
@@ -601,7 +591,6 @@ private:
             return;
         }
 
-        // Success → reset counter
         consecutive_fails_ = 0;
 
         publish_local_trajectory(best_traj, now(), robot_x, robot_y, robot_yaw);
@@ -610,7 +599,6 @@ private:
         publish_cmd(best_v, best_w);
     }
 
-    // [v6] Check if recovery should start
     void trigger_recovery_if_needed()
     {
         if (!recovery_enabled_) return;
@@ -628,16 +616,16 @@ private:
     }
 
     // =====================================================================
-    // A* Global Planner  [v7: inflation-aware]
+    // A* Global Planner  [v8: decay-only inflation]
     //
-    // Before planning, inflates the costmap by the robot's inscribed
-    // radius so that A* paths maintain sufficient clearance for DWA.
+    // Instead of a lethal inner zone (which caused the inner_r > outer_r bug),
+    // v8 uses exponential cost decay only. Original lethal cells remain lethal,
+    // but inflated cells get high (not lethal) costs. This means:
+    //   - A* can ALWAYS find a path through narrow corridors
+    //   - A* strongly PREFERS paths away from walls (high cost near walls)
+    //   - No more "no path" from over-inflation
     // =====================================================================
 
-    // Build inflated cost grid from raw costmap
-    // Two-zone inflation:
-    //   Inner zone (0 ~ inscribed radius): lethal → A* hard-blocks
-    //   Outer zone (inscribed ~ inflation_radius): decaying cost → A* avoids
     std::vector<int> inflate_costmap(
         const nav_msgs::msg::OccupancyGrid::ConstSharedPtr &costmap)
     {
@@ -646,12 +634,8 @@ private:
         const auto &data = costmap->data;
         const int lethal = static_cast<int>(astar_lethal_);
 
-        // Inner zone: inscribed radius (hard lethal)
-        double inscribed_r = std::min(robot_length_, robot_width_) / 2.0;
-        int inner_r = static_cast<int>(std::ceil(inscribed_r / costmap_resolution_));
-
-        // Outer zone: inflation_radius_ (decaying cost)
-        int outer_r = static_cast<int>(std::ceil(inflation_radius_ / costmap_resolution_));
+        // Inflation radius in cells
+        int inflate_r = static_cast<int>(std::ceil(inflation_radius_ / costmap_resolution_));
 
         // Start with original costs
         std::vector<int> inflated(rows * cols);
@@ -659,33 +643,35 @@ private:
             inflated[i] = data[i];
         }
 
-        // For each lethal cell, inflate surrounding cells
+        // For each lethal cell, add decaying cost to surrounding cells
         for (int r = 0; r < rows; ++r) {
             for (int c = 0; c < cols; ++c) {
                 int raw = data[r * cols + c];
                 if (raw < lethal) continue;  // only inflate from lethal cells
 
-                for (int dr = -outer_r; dr <= outer_r; ++dr) {
-                    for (int dc = -outer_r; dc <= outer_r; ++dc) {
+                for (int dr = -inflate_r; dr <= inflate_r; ++dr) {
+                    for (int dc = -inflate_r; dc <= inflate_r; ++dc) {
+                        if (dr == 0 && dc == 0) continue;  // skip the lethal cell itself
                         int nr = r + dr, nc = c + dc;
                         if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
 
                         double dist_cells = std::hypot(dr, dc);
-                        if (dist_cells > outer_r) continue;
+                        if (dist_cells > inflate_r) continue;
 
-                        int inflated_cost;
-                        if (dist_cells <= inner_r) {
-                            // Inner zone: hard lethal — A* cannot pass here
-                            inflated_cost = lethal;
-                        } else {
-                            // Outer zone: linear decay from lethal-1 to lethal/2
-                            double t = (dist_cells - inner_r) / std::max(1.0, (double)(outer_r - inner_r));
-                            inflated_cost = static_cast<int>(lethal * (0.95 - 0.45 * t));
-                            // clamp: at inner_r boundary ~85, at outer_r boundary ~45
-                        }
+                        // [v8] Exponential decay: cost drops with distance
+                        // At distance 1 cell: cost ≈ lethal - 5 (very high)
+                        // At distance inflate_r: cost ≈ lethal * 0.3 (moderate)
+                        // Never reaches lethal → A* can always pass
+                        double ratio = dist_cells / static_cast<double>(inflate_r);
+                        int decay_cost = static_cast<int>(
+                            (lethal - 1) * std::exp(-2.0 * ratio));
+                        // Clamp to [1, lethal-1] — never lethal, never zero
+                        decay_cost = std::clamp(decay_cost, 1, lethal - 1);
 
                         int idx = nr * cols + nc;
-                        inflated[idx] = std::max(inflated[idx], inflated_cost);
+                        // Don't overwrite original lethal cells
+                        if (inflated[idx] >= lethal) continue;
+                        inflated[idx] = std::max(inflated[idx], decay_cost);
                     }
                 }
             }
@@ -694,7 +680,6 @@ private:
         return inflated;
     }
 
-    // Find nearest free cell in the inflated grid (for goal relocation)
     Cell find_nearest_free_inflated(
         const std::vector<int> &inflated, int rows, int cols,
         const Cell &target)
@@ -732,8 +717,7 @@ private:
             return inflated[r * cols + c];
         };
 
-        // Start cell: robot is already here, force-clear even if inflated
-        // (otherwise A* can't start when robot is near an obstacle)
+        // Start cell: force-clear even if inflated
         if (get_cost(start.r, start.c) >= lethal) {
             inflated[start.r * cols + start.c] = lethal - 1;
         }
@@ -837,7 +821,7 @@ private:
     }
 
     // =====================================================================
-    // DWA Local Planner  [v5: 2-tier collision — center hard, perimeter soft]
+    // DWA Local Planner  [v5: 2-tier collision]
     // =====================================================================
     struct DWAResult {
         double v, w;
@@ -859,11 +843,10 @@ private:
         const double half = costmap_size_ / 2.0;
         const int lethal = static_cast<int>(astar_lethal_);
 
-        // Heading error for spin decision
         double heading_to_goal = std::atan2(goal_local_y, goal_local_x);
         double abs_heading_err = std::abs(heading_to_goal);
 
-        // Footprint perimeter sample points (robot frame)
+        // Footprint perimeter sample points
         double half_l = robot_length_ / 2.0 + clearance_margin_;
         double half_w = robot_width_ / 2.0 + clearance_margin_;
         double fp_step = costmap_resolution_ * 3.0;
@@ -878,7 +861,6 @@ private:
             footprint_pts.push_back({fx, -half_w});
         }
 
-        // Inscribed radius: hard reject if obstacle within this distance
         double inscribed_r = std::min(robot_length_, robot_width_) / 2.0;
         int inscribed_cells = static_cast<int>(std::ceil(inscribed_r / costmap_resolution_));
 
@@ -895,8 +877,8 @@ private:
                 double x = 0.0, y = 0.0, theta = 0.0;
                 bool hard_collision = false;
                 double min_clearance = std::numeric_limits<double>::max();
-                int total_fp_hits = 0;      // perimeter lethal hit count
-                int total_fp_checks = 0;    // total perimeter checks performed
+                int total_fp_hits = 0;
+                int total_fp_checks = 0;
                 std::vector<std::pair<double, double>> traj;
                 traj.reserve(sim_steps);
 
@@ -909,21 +891,19 @@ private:
                     int gc = static_cast<int>((x + half) / costmap_resolution_);
                     int gr = static_cast<int>((y + half) / costmap_resolution_);
 
-                    // Outside costmap — penalize but don't reject
                     if (gc < 0 || gc >= grid_cells_ || gr < 0 || gr >= grid_cells_) {
                         min_clearance = std::min(min_clearance, 0.1);
                         continue;
                     }
 
-                    // ── Tier 1: CENTER POINT — hard reject ──
+                    // Tier 1: CENTER POINT
                     int cc_val = costmap->data[gr * grid_cells_ + gc];
                     if (cc_val >= lethal) {
                         hard_collision = true;
                         break;
                     }
 
-                    // ── Tier 1.5: INSCRIBED CIRCLE — hard reject ──
-                    // Check a small cross pattern (fast approximation)
+                    // Tier 1.5: INSCRIBED CIRCLE
                     bool inscribed_hit = false;
                     for (int d = 1; d <= inscribed_cells && !inscribed_hit; ++d) {
                         if (gr+d < grid_cells_ && costmap->data[(gr+d)*grid_cells_+gc] >= lethal) inscribed_hit = true;
@@ -936,7 +916,7 @@ private:
                         break;
                     }
 
-                    // ── Tier 2: PERIMETER — soft penalty (every 3rd step) ──
+                    // Tier 2: PERIMETER (every 3rd step)
                     if (s % 3 == 0) {
                         double cos_t = std::cos(theta);
                         double sin_t = std::sin(theta);
@@ -961,35 +941,28 @@ private:
                     }
                 }
 
-                // Hard collision (center or inscribed circle) → reject
                 if (hard_collision) continue;
 
-                // Perimeter: >50% lethal → reject (surrounded by obstacles)
                 double fp_hit_ratio = 0.0;
                 if (total_fp_checks > 0) {
                     fp_hit_ratio = static_cast<double>(total_fp_hits) / total_fp_checks;
                     if (fp_hit_ratio > 0.5) continue;
                 }
 
-                // ── Scoring ──
-
-                // (a) Heading: cosine-based
+                // Scoring
                 double ang = std::atan2(goal_local_y - y, goal_local_x - x);
                 double herr = std::abs(normalize_angle(ang - theta));
                 double heading_score = (1.0 + std::cos(herr)) / 2.0;
 
-                // (b) Clearance
                 double clearance_score = (min_clearance < std::numeric_limits<double>::max())
                     ? min_clearance : 1.0;
 
-                // (c) Velocity: forward preference
                 double velocity_score = 0.0;
                 if (max_lin_vel_ > 0.0) {
                     velocity_score = v / max_lin_vel_;
                     if (v < 0.0) velocity_score *= 0.3;
                 }
 
-                // (d) Path distance
                 double path_dist_score = 1.0;
                 if (!global_path.empty()) {
                     double min_d = std::numeric_limits<double>::max();
@@ -1000,7 +973,6 @@ private:
                     path_dist_score = std::max(0.0, 1.0 - min_d);
                 }
 
-                // (e) Spin penalty
                 double spin_penalty = 0.0;
                 if (abs_heading_err < spin_heading_threshold_) {
                     if (std::abs(v) < 0.05 && std::abs(w) > 0.1) {
@@ -1008,8 +980,6 @@ private:
                     }
                 }
 
-                // (f) Footprint proximity penalty — proportional to perimeter hits
-                //     0 hits → 0 penalty, 50% hits → -1.0 penalty
                 double fp_penalty = -2.0 * fp_hit_ratio;
 
                 double score = w_heading_ * heading_score
@@ -1158,8 +1128,8 @@ private:
     rclcpp::Time last_replan_time_{0, 0, RCL_ROS_TIME};
     bool need_replan_ = true;
 
-    // [v6] Recovery state
-    int consecutive_fails_ = 0;         // counts A* + DWA + pursuit failures
+    // Recovery state
+    int consecutive_fails_ = 0;
     bool recovery_active_ = false;
     rclcpp::Time recovery_start_time_{0, 0, RCL_ROS_TIME};
     int recovery_attempts_ = 0;
@@ -1184,14 +1154,14 @@ private:
     double velocity_lookahead_gain_;
     double spin_heading_threshold_;
 
-    // [v6] Recovery parameters
+    // Recovery parameters
     bool recovery_enabled_;
     int recovery_fail_count_;
     double recovery_reverse_vel_;
     double recovery_reverse_duration_;
     int recovery_max_attempts_;
 
-    // [v7] Inflation
+    // Inflation
     double inflation_radius_;
 };
 

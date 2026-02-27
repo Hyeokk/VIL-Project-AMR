@@ -1,65 +1,53 @@
 # path_planner parameters for DONKEYBOTI caterpillar robot
 # A* global planner + Pure Pursuit + DWA local planner
 #
-# Costmap: 5m x 5m, 0.1m resolution = 50x50 cells
-# Robot: differential-drive (skid-steer), turn-in-place capable
-#
-# [v2] A* terrain cost tuning for outdoor grass
-# [v3] Anti-spin fixes: goal frame transform, DWA forward-bias, rectangular footprint
+# [v9] Inflation removed — now handled by terrain_costmap v3
+#      A* reads pre-inflated costmap directly
+#      DWA also benefits from inflated costs (no longer blind to wall proximity)
 
 path_planner_node:
   ros__parameters:
     # --- Costmap (must match terrain_costmap) ---
-    costmap_size: 5.0           # [m] side length
-    costmap_resolution: 0.1     # [m] cell size → 50x50
+    costmap_size: 5.0
+    costmap_resolution: 0.1
 
     # --- Robot kinematics ---
-    max_lin_vel: 0.6            # [m/s] max forward velocity
-    min_lin_vel: -0.2           # [m/s] max reverse (limited for safety)
-    max_ang_vel: 0.5            # [rad/s] max turn rate
-    max_lin_acc: 1.0            # [m/s²] linear acceleration limit
-    max_ang_acc: 2.0            # [rad/s²] angular acceleration limit
+    max_lin_vel: 0.6
+    min_lin_vel: -0.2
+    max_ang_vel: 0.5
+    max_lin_acc: 1.0
+    max_ang_acc: 2.0
 
     # --- DWA sampling ---
-    n_v_samples: 11             # linear velocity samples
-    n_w_samples: 21             # angular velocity samples
-    sim_time: 1.5               # [s] forward simulation horizon
-    sim_granularity: 0.1        # [s] simulation time step
+    n_v_samples: 11
+    n_w_samples: 21
+    sim_time: 2.0               # longer horizon for smoother paths
+    sim_granularity: 0.1
 
     # --- DWA scoring weights ---
-    # [v3] Rebalanced: velocity↑, heading↓ to prevent unnecessary spinning
-    # weight_heading: 1.0       # [v1-v2]
-    weight_heading: 0.6         # [v3] heading alignment (reduced)
-    weight_clearance: 0.5       # terrain cost / obstacle distance
-    # weight_velocity: 0.3      # [v1-v2]
-    weight_velocity: 0.8        # [v3] forward motion preference (increased)
-    weight_path_dist: 0.8       # closeness to A* global path
+    weight_heading: 0.5
+    weight_clearance: 1.2       # high — obstacle avoidance priority
+    weight_velocity: 0.6
+    weight_path_dist: 0.6
 
     # --- Goal tolerance ---
-    goal_xy_tolerance: 0.3      # [m] position tolerance (stop when this close)
-    # goal_yaw_tolerance not used — robot stops on position only
+    goal_xy_tolerance: 0.3
 
     # --- A* configuration ---
-    astar_lethal_cost: 90.0     # [v2] cells >= this are impassable
-    # astar_cost_weight: 1.0    # [v2] original — too weak, A* hugged obstacles
-    astar_cost_weight: 2.0      # [v7] terrain cost penalty (↑ = prefer open space)
+    astar_lethal_cost: 90.0
+    astar_cost_weight: 3.0      # inflated costs already high, this amplifies further
 
-    # --- Robot footprint (rectangular) ---
-    # [v3] Replaced robot_radius with actual dimensions
-    # Collision check uses oriented rectangle, not circle
-    robot_length: 1.432         # [m] front-to-back (x-axis)
-    robot_width: 0.850          # [m] left-to-right (y-axis)
-    clearance_margin: 0.1       # [m] extra safety buffer around footprint
+    # --- Robot footprint ---
+    robot_length: 1.432
+    robot_width: 0.850
+    clearance_margin: 0.1
 
-    # --- [v7] A* costmap inflation ---
-    # Inflates obstacles by this radius before A* planning, so paths keep distance.
-    # -1 = auto (inscribed radius + clearance = 0.525m → 6 cells)
-    # Increase if robot still clips obstacles on narrow passages
-    # Decrease if robot can't find paths through wide-enough corridors
-    inflation_radius: 0.4      # [m] -1=auto, or set explicitly e.g. 0.6
+    # --- [v9] Inflation disabled in path_planner ---
+    # Set to 0 — costmap already inflated by terrain_costmap v3
+    inflation_radius: 0.0
 
     # --- Control ---
-    control_rate: 20.0          # [Hz]
+    control_rate: 20.0
 
     # --- Frames ---
     odom_frame: "odom"
@@ -70,27 +58,24 @@ path_planner_node:
     goal_topic: "/goal_pose"
     cmd_vel_topic: "/cmd_vel"
 
-    # --- Slope speed reduction ---
+    # --- Slope ---
     slope_speed_factor: 0.5
     slope_threshold_deg: 15.0
 
     # --- Path Caching & Pure Pursuit ---
-    replan_interval: 1.0              # [s] periodic A* replan interval
-    path_deviation_threshold: 0.5     # [m] replan if robot deviates this far
-    pure_pursuit_lookahead: 0.4       # [m] base lookahead distance
-    pure_pursuit_lookahead_min: 0.2   # [m] minimum lookahead (low speed)
-    pure_pursuit_lookahead_max: 0.8   # [m] maximum lookahead (high speed)
-    velocity_lookahead_gain: 0.5      # lookahead = base + gain * |v|
+    replan_interval: 2.0
+    path_deviation_threshold: 0.5
+    pure_pursuit_lookahead: 0.8
+    pure_pursuit_lookahead_min: 0.4
+    pure_pursuit_lookahead_max: 1.2
+    velocity_lookahead_gain: 0.5
 
-    # --- [v3] Spin prevention ---
-    # When heading error to goal < this threshold, penalize pure rotation (v≈0, |w|>0)
-    # Forces robot to drive forward while turning instead of spinning in place
-    spin_heading_threshold: 1.05      # [rad] ~60°
+    # --- Spin prevention ---
+    spin_heading_threshold: 1.05
 
-    # --- [v6] Recovery behavior ---
-    # When DWA fails N consecutive times, robot backs up and replans
+    # --- Recovery ---
     recovery_enabled: true
-    recovery_fail_count: 5            # consecutive DWA failures to trigger recovery
-    recovery_reverse_vel: -0.15       # [m/s] backup speed (negative = reverse)
-    recovery_reverse_duration: 1.5    # [s] how long to back up
-    recovery_max_attempts: 3          # max recoveries per goal (then give up)
+    recovery_fail_count: 5
+    recovery_reverse_vel: -0.15
+    recovery_reverse_duration: 1.5
+    recovery_max_attempts: 3
