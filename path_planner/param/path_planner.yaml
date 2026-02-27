@@ -19,6 +19,7 @@ path_planner_node:
     max_ang_acc: 2.0
 
     # --- DWA sampling ---
+<<<<<<< HEAD
     n_v_samples: 11
     n_w_samples: 21
     sim_time: 2.0               # longer horizon for smoother paths
@@ -29,6 +30,21 @@ path_planner_node:
     weight_clearance: 1.2       # high — obstacle avoidance priority
     weight_velocity: 0.6
     weight_path_dist: 0.6
+=======
+    n_v_samples: 11             # linear velocity samples
+    n_w_samples: 21             # angular velocity samples
+    sim_time: 2.0               # [s] forward simulation horizon
+    sim_granularity: 0.1        # [s] simulation time step
+
+    # --- DWA scoring weights ---
+    # [v3] Rebalanced: velocity↑, heading↓ to prevent unnecessary spinning
+    # weight_heading: 1.0       # [v1-v2]
+    weight_heading: 0.5         # [v3] heading alignment (reduced)
+    weight_clearance: 1.2       # terrain cost / obstacle distance
+    # weight_velocity: 0.3      # [v1-v2]
+    weight_velocity: 0.6        # [v3] forward motion preference (increased)
+    weight_path_dist: 0.6       # closeness to A* global path
+>>>>>>> 2ecc61b68229f864b9acf00d65dfb9dbdfe7b6bc
 
     # --- Goal tolerance ---
     goal_xy_tolerance: 0.3
@@ -63,12 +79,21 @@ path_planner_node:
     slope_threshold_deg: 15.0
 
     # --- Path Caching & Pure Pursuit ---
+<<<<<<< HEAD
     replan_interval: 2.0
     path_deviation_threshold: 0.5
     pure_pursuit_lookahead: 0.8
     pure_pursuit_lookahead_min: 0.4
     pure_pursuit_lookahead_max: 1.2
     velocity_lookahead_gain: 0.5
+=======
+    replan_interval: 2.0              # [s] periodic A* replan interval
+    path_deviation_threshold: 0.5     # [m] replan if robot deviates this far
+    pure_pursuit_lookahead: 0.6       # [m] base lookahead distance
+    pure_pursuit_lookahead_min: 0.4   # [m] minimum lookahead (low speed)
+    pure_pursuit_lookahead_max: 1.2   # [m] maximum lookahead (high speed)
+    velocity_lookahead_gain: 0.5      # lookahead = base + gain * |v|
+>>>>>>> 2ecc61b68229f864b9acf00d65dfb9dbdfe7b6bc
 
     # --- Spin prevention ---
     spin_heading_threshold: 1.05
