@@ -47,8 +47,11 @@ sudo apt update && sudo apt install -y libqnn1 libsnpe1 libqnn-dev libsnpe-dev
 sudo apt install -y clinfo qcom-adreno1
 sudo ln -sf /lib/aarch64-linux-gnu/libOpenCL.so.1.0.0 /usr/lib/libOpenCL.so
 
-python3 -m venv ~/ort_env && source ~/ort_env/bin/activate
-pip install onnxruntime-qnn numpy opencv-python-headless
+python3 -m venv ~/ort_env --system-site-packages
+source ~/ort_env/bin/activate
+pip install --upgrade pip
+pip install https://github.com/ZIFENG278/onnxruntime/releases/download/v1.23.2/onnxruntime_qnn-1.23.2-cp312-cp312-linux_aarch64.whl
+pip install opencv-python-headless numpy
 ```
 
 ### Model
